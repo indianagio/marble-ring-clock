@@ -14,11 +14,12 @@
  *  - ledReverse: inverte la direzione di scorrimento dell'anello
  *  - ledModel modificabile dalla webapp (richiede reboot per reinit FastLED)
  *  - showSeconds: lancetta secondi on/off + colore/intensità configurabili
- *    Utile per verificare la mappatura dei LED senza il disturbo del secondo
- *    che si sovrappone a ore/minuti
- *  - FIX: ArduinoJson v7 - doc[x].is<bool>() non funziona per booleani JSON
- *    nativi. Sostituito con controllo !doc[x].isNull() per showSeconds,
- *    ntpEnabled, ledReverse.
+ *  - FIX v1: ArduinoJson v7 - doc[x].is<bool>() non funziona per booleani
+ *    JSON nativi. Sostituito con jsonBool() helper.
+ *  - FIX v2: jsonBool() accedeva doc[key] due volte (isNull + cast).
+ *    In ArduinoJson v7 il secondo accesso può restituire un proxy invalidato.
+ *    Soluzione definitiva: estrarre JsonVariant UNA SOLA VOLTA e usare
+ *    v.isNull() + v.as<bool>() sullo stesso oggetto.
  */
 
 #include <Arduino.h>
@@ -103,7 +104,6 @@ void loadConfig() {
   cfg.hourBrightness = prefs.getInt("hBri",        200);
   cfg.minBrightness  = prefs.getInt("mBri",        255);
   cfg.secBrightness  = prefs.getInt("sBri",        160);
-  // Default true: al primo avvio i secondi sono visibili (facile capire se il ring funziona)
   cfg.showSeconds    = prefs.getBool("showSec",    true);
   cfg.utcOffsetSec   = prefs.getInt("utcOff",      DEFAULT_UTC_OFFSET);
   cfg.manualHour     = prefs.getInt("manHour",     -1);
@@ -116,6 +116,8 @@ void loadConfig() {
   cfg.ledSkip        = prefs.getInt("ledSkip",     DEFAULT_LED_SKIP);
   cfg.ledReverse     = prefs.getBool("ledReverse", false);
   prefs.end();
+  DBG.printf("loadConfig: showSec=%d ntpEn=%d ledRev=%d\n",
+    cfg.showSeconds, cfg.ntpEnabled, cfg.ledReverse);
 }
 
 void saveConfig() {
@@ -148,6 +150,8 @@ void saveConfig() {
   prefs.putInt("ledSkip",     cfg.ledSkip);
   prefs.putBool("ledReverse", cfg.ledReverse);
   prefs.end();
+  DBG.printf("saveConfig: showSec=%d ntpEn=%d ledRev=%d\n",
+    cfg.showSeconds, cfg.ntpEnabled, cfg.ledReverse);
 }
 
 // --- LED mapping -------------------------------------------------------------
@@ -333,14 +337,14 @@ static const char FALLBACK_HTML[] PROGMEM =
 "document.getElementById('numLeds').value=d.numLeds;"
 "document.getElementById('ledSkip').value=d.ledSkip!=null?d.ledSkip:1;"
 "document.getElementById('ledOffset').value=d.ledOffset||0;"
-"document.getElementById('ledReverse').checked=d.ledReverse||false;"
+"document.getElementById('ledReverse').checked=d.ledReverse===true;"
 "document.getElementById('brightness').value=d.brightness;"
 "document.getElementById('hR').value=d.hourR;document.getElementById('hG').value=d.hourG;document.getElementById('hB').value=d.hourB;"
 "document.getElementById('mR').value=d.minR;document.getElementById('mG').value=d.minG;document.getElementById('mB').value=d.minB;"
-"document.getElementById('sR').value=d.secR||200;document.getElementById('sG').value=d.secG||0;document.getElementById('sB').value=d.secB||0;"
+"document.getElementById('sR').value=d.secR!=null?d.secR:200;document.getElementById('sG').value=d.secG||0;document.getElementById('sB').value=d.secB||0;"
 "document.getElementById('hBri').value=d.hourBrightness;document.getElementById('mBri').value=d.minBrightness;"
-"document.getElementById('sBri').value=d.secBrightness||160;"
-"document.getElementById('showSeconds').checked=d.showSeconds===true;"
+"document.getElementById('sBri').value=d.secBrightness!=null?d.secBrightness:160;"
+"document.getElementById('showSeconds').checked=(d.showSeconds===true);"
 "document.getElementById('utcOff').value=d.utcOffsetSec;"
 "document.getElementById('manH').value=d.manualHour;document.getElementById('manM').value=d.manualMinute;"
 "document.getElementById('mapMode').value=d.mappingMode;"
@@ -370,14 +374,19 @@ static const char FALLBACK_HTML[] PROGMEM =
 "</script></body></html>";
 
 // ---------------------------------------------------------------------------
-// Helper: legge un campo booleano da JsonDocument in modo compatibile
-// con ArduinoJson v6 e v7.
-// In v7, doc[key].is<bool>() può restituire false per booleani JSON nativi;
-// il metodo sicuro è controllare che il campo esista (!isNull()) e castarlo.
+// Legge un campo booleano da JsonDocument in modo sicuro per ArduinoJson v7.
+//
+// IMPORTANTE: accedere doc[key] DUE VOLTE separatamente (come facevano le
+// versioni precedenti) non funziona in v7 perché il secondo accesso a un
+// JsonVariant booleano può restituire un proxy invalidato/diverso.
+//
+// Soluzione: estrarre il JsonVariant UNA SOLA VOLTA con una variabile locale,
+// poi chiamare isNull() e as<bool>() sullo stesso oggetto.
 // ---------------------------------------------------------------------------
-static inline bool jsonBool(JsonDocument& doc, const char* key, bool fallback) {
-  if (doc[key].isNull()) return fallback;
-  return (bool)doc[key];
+static inline bool readJsonBool(JsonDocument& doc, const char* key, bool fallback) {
+  JsonVariant v = doc[key];          // un solo accesso al documento
+  if (v.isNull()) return fallback;   // campo assente → usa fallback
+  return v.as<bool>();               // cast sicuro su stesso proxy
 }
 
 // --- Web server --------------------------------------------------------------
@@ -423,7 +432,10 @@ void setupWebServer() {
     doc["hourBrightness"] = cfg.hourBrightness;
     doc["minBrightness"]  = cfg.minBrightness;
     doc["secBrightness"]  = cfg.secBrightness;
-    doc["showSeconds"]    = cfg.showSeconds;
+    // Serializza showSeconds come intero (0/1) oltre che bool per evitare
+    // qualsiasi ambiguità sul lato client nel parsing JSON.
+    doc["showSeconds"]    = cfg.showSeconds ? 1 : 0;
+    doc["showSecondsBool"]= cfg.showSeconds;  // campo bool nativo per debug
     doc["utcOffsetSec"]   = cfg.utcOffsetSec;
     doc["ntpEnabled"]     = cfg.ntpEnabled;
     doc["ledDensity"]     = cfg.ledDensity;
@@ -433,7 +445,7 @@ void setupWebServer() {
     doc["ledModel"]       = cfg.ledModel;
     doc["ledOffset"]      = cfg.ledOffset;
     doc["ledSkip"]        = cfg.ledSkip;
-    doc["ledReverse"]     = cfg.ledReverse;
+    doc["ledReverse"]     = cfg.ledReverse ? 1 : 0;
     String json;
     serializeJson(doc, json);
     req->send(200, "application/json", json);
@@ -467,11 +479,29 @@ void setupWebServer() {
       if (!doc["minBrightness"].isNull())    cfg.minBrightness  = constrain((int)doc["minBrightness"], 0, 255);
       if (!doc["secBrightness"].isNull())    cfg.secBrightness  = constrain((int)doc["secBrightness"], 0, 255);
 
-      // FIX: usare jsonBool() per compatibilita ArduinoJson v6/v7
-      // doc[x].is<bool>() non funziona in v7 per true/false JSON nativi
-      if (!doc["showSeconds"].isNull())  cfg.showSeconds = jsonBool(doc, "showSeconds", cfg.showSeconds);
-      if (!doc["ntpEnabled"].isNull())   cfg.ntpEnabled  = jsonBool(doc, "ntpEnabled",  cfg.ntpEnabled);
-      if (!doc["ledReverse"].isNull())   cfg.ledReverse  = jsonBool(doc, "ledReverse",  cfg.ledReverse);
+      // FIX DEFINITIVO: readJsonBool() accede doc[key] UNA SOLA VOLTA
+      // (via JsonVariant locale) ed usa .as<bool>() sullo stesso proxy.
+      // Il vecchio jsonBool() accedeva doc[key] due volte separatamente,
+      // causando comportamento undefined in ArduinoJson v7.
+      {
+        JsonVariant v = doc["showSeconds"];
+        if (!v.isNull()) {
+          // Accetta sia bool nativi (true/false) che interi (0/1)
+          // mandati dalla webapp come fallback di compatibilità.
+          bool newVal = v.as<bool>();
+          DBG.printf("showSeconds raw JSON type=%d as<bool>=%d\n",
+            (int)v.is<bool>(), newVal ? 1 : 0);
+          cfg.showSeconds = newVal;
+        }
+      }
+      {
+        JsonVariant v = doc["ntpEnabled"];
+        if (!v.isNull()) cfg.ntpEnabled = v.as<bool>();
+      }
+      {
+        JsonVariant v = doc["ledReverse"];
+        if (!v.isNull()) cfg.ledReverse = v.as<bool>();
+      }
 
       if (!doc["utcOffsetSec"].isNull()) {
         int newOff = (int)doc["utcOffsetSec"];
@@ -490,7 +520,7 @@ void setupWebServer() {
       FastLED.setBrightness(cfg.brightness);
       saveConfig();
 
-      DBG.printf("Config aggiornata: showSec=%d ntpEn=%d ledRev=%d\n",
+      DBG.printf("Config finale: showSec=%d ntpEn=%d ledRev=%d\n",
         cfg.showSeconds, cfg.ntpEnabled, cfg.ledReverse);
 
       if (utcChanged && wifiConnected && cfg.ntpEnabled) syncNTP();

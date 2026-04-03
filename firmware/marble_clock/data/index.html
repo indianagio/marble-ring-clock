@@ -380,9 +380,13 @@ function showToast(msg,type){
 var clock={h:0,m:0,s:0,lastSyncAt:0};
 var state={};
 
-// FIX: forceUpdate bypassa il guard 'userIsEditing' per una sola chiamata
-// (usato subito dopo un save per ricaricare lo stato confermato dal server)
-var forceNextUpdate=false;
+// Guard: dopo un salvataggio, blocca l'aggiornamento dei campi UI per
+// 10 secondi. Questo impedisce che il poll periodico (ogni 5s) sovrascriva
+// i valori appena impostati dall'utente nel caso in cui il server risponda
+// con lo stato vecchio prima che il nuovo sia stato applicato.
+// Il guard viene alzato in saveColors() e abbassato dopo 10s o dopo
+// che il fetchStatus di conferma ha completato.
+var pendingSaveUntil = 0;
 
 function fetchStatus(){
   fetch('/api/status')
@@ -396,10 +400,12 @@ function fetchStatus(){
         clock.lastSyncAt=Date.now();
       }
       updateStatusBar();
-      // Aggiorna sempre i campi: non c'e' piu' un guard userIsEditing
-      // che blocca l'UI. I campi vengono aggiornati dal server ogni 5s.
-      // L'utente modifica -> salva -> fetchStatus immediato -> UI aggiornata.
-      updateFormFields();
+      // Aggiorna i campi UI solo se NON siamo in finestra post-salvataggio.
+      // Questo evita che il fetchStatus periodico rimetta i valori vecchi
+      // mentre il server sta ancora applicando la nuova config.
+      if(Date.now() >= pendingSaveUntil){
+        updateFormFields();
+      }
     })
     .catch(function(){
       document.getElementById('wifi-dot').className='dot err';
@@ -409,12 +415,17 @@ function fetchStatus(){
 
 function sv(id,val){var el=document.getElementById(id);if(el)el.value=val;}
 function setRange(id,val){sv(id,val);var v=document.getElementById(id+'-val');if(v)v.textContent=val;}
+
+// setChk: aggiorna un checkbox.
+// IMPORTANTE: il server ora manda showSeconds come intero (0 o 1) per
+// evitare ambiguità nel parsing JSON. Usiamo !!(val) per gestire sia
+// booleani nativi che interi 0/1 che potrebbero arrivare dal server.
 function setChk(id,val){
   var el=document.getElementById(id);
   if(!el)return;
-  // FIX: confronto esplicito === true per evitare falsy su null/undefined
-  el.checked=(val===true);
+  el.checked=!!(val);
 }
+
 function toHex(r,g,b){return '#'+[r||0,g||0,b||0].map(function(v){return (v&255).toString(16).padStart(2,'0');}).join('');}
 
 function updateStatusBar(){
@@ -429,15 +440,14 @@ function updateFormFields(){
   sv('ledSkip',state.ledSkip!=null?state.ledSkip:1);
   sv('mappingMode',state.mappingMode||0);
   sv('ledOffset',state.ledOffset||0);
-  // FIX: setChk usa === true per garantire che false/null non vengano interpretati come true
-  setChk('ledReverse',state.ledReverse===true);
+  // ledReverse e showSeconds arrivano come interi 0/1 dal server (fix firmware)
+  setChk('ledReverse',state.ledReverse);
   setRange('brightness',state.brightness||80);
   setRange('hourBrightness',state.hourBrightness||200);
   setRange('minBrightness',state.minBrightness||255);
   setRange('secBrightness',state.secBrightness!=null?state.secBrightness:160);
-  // FIX PRINCIPALE: setChk con ===true + chiama onShowSecondsChange() per
-  // aggiornare immediatamente lo stato visivo del pannello secondi
-  setChk('showSeconds',state.showSeconds===true);
+  // FIX: showSeconds arriva come 0/1 (intero). !!(0)=false, !!(1)=true.
+  setChk('showSeconds',state.showSeconds);
   onShowSecondsChange();
   var hHex=toHex(state.hourR,state.hourG,state.hourB);
   var mHex=toHex(state.minR,state.minG,state.minB);
@@ -445,7 +455,7 @@ function updateFormFields(){
   sv('hourColor',hHex);sv('minColor',mHex);sv('secColor',sHex);
   updateColorDisplay('hour');updateColorDisplay('min');updateColorDisplay('sec');
   sv('utcOffsetSec',state.utcOffsetSec!=null?state.utcOffsetSec:3600);
-  setChk('ntpEnabled',state.ntpEnabled!==false);
+  setChk('ntpEnabled',state.ntpEnabled!==0);
   sv('manualHour',state.manualHour!=null?state.manualHour:-1);
   sv('manualMinute',state.manualMinute||0);
   sv('ssid',state.ssid||'');
@@ -554,7 +564,8 @@ function saveLed(){
         setTimeout(function(){fetch('/api/reconnect',{method:'POST'});},1000);
       } else {
         showToast('Impostazioni LED salvate!');
-        fetchStatus();
+        pendingSaveUntil=Date.now()+10000;
+        setTimeout(function(){pendingSaveUntil=0;fetchStatus();},1500);
       }
     })
     .catch(function(){showToast('Errore salvataggio','err');});
@@ -571,7 +582,8 @@ function saveTimeSettings(){
     .then(function(r){return r.json();})
     .then(function(){
       showToast('Fuso orario applicato!');
-      setTimeout(function(){clock.lastSyncAt=0;fetchStatus();},2000);
+      pendingSaveUntil=Date.now()+10000;
+      setTimeout(function(){pendingSaveUntil=0;clock.lastSyncAt=0;fetchStatus();},2000);
     })
     .catch(function(){showToast('Errore','err');});
 }
@@ -581,6 +593,7 @@ function saveColors(){
   var hc=h2c(document.getElementById('hourColor').value);
   var mc=h2c(document.getElementById('minColor').value);
   var sc=h2c(document.getElementById('secColor').value);
+  var showSec=document.getElementById('showSeconds').checked;
   var body={
     hourR:hc.r,hourG:hc.g,hourB:hc.b,
     minR:mc.r,minG:mc.g,minB:mc.b,
@@ -588,11 +601,27 @@ function saveColors(){
     hourBrightness:Number(document.getElementById('hourBrightness').value),
     minBrightness:Number(document.getElementById('minBrightness').value),
     secBrightness:Number(document.getElementById('secBrightness').value),
-    showSeconds:document.getElementById('showSeconds').checked
+    // Invia showSeconds come intero (1/0) invece di bool nativo per
+    // massima compatibilità con ArduinoJson v7 sul firmware ESP32.
+    // v.as<bool>() funziona correttamente con interi JSON.
+    showSeconds: showSec ? 1 : 0
   };
+  // Alza il guard: per i prossimi 10s il poll non sovrascrive i campi UI.
+  pendingSaveUntil=Date.now()+10000;
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(function(){showToast('Colori salvati!');fetchStatus();})
-    .catch(function(){showToast('Errore','err');});
+    .then(function(){
+      showToast('Colori salvati!');
+      // Rileggi dopo 1.5s per confermare che il server ha applicato la config.
+      // Se showSeconds non corrisponde, verrà mostrato lo stato reale.
+      setTimeout(function(){
+        pendingSaveUntil=0;
+        fetchStatus();
+      },1500);
+    })
+    .catch(function(){
+      pendingSaveUntil=0;
+      showToast('Errore','err');
+    });
 }
 
 function saveWifi(){
