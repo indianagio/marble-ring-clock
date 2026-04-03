@@ -16,6 +16,9 @@
  *  - showSeconds: lancetta secondi on/off + colore/intensità configurabili
  *    Utile per verificare la mappatura dei LED senza il disturbo del secondo
  *    che si sovrappone a ore/minuti
+ *  - FIX: ArduinoJson v7 - doc[x].is<bool>() non funziona per booleani JSON
+ *    nativi. Sostituito con controllo !doc[x].isNull() per showSeconds,
+ *    ntpEnabled, ledReverse.
  */
 
 #include <Arduino.h>
@@ -58,18 +61,18 @@ struct Config {
   int     brightness;
   uint8_t hourR, hourG, hourB;
   uint8_t minR,  minG,  minB;
-  uint8_t secR,  secG,  secB;   // colore lancetta secondi
+  uint8_t secR,  secG,  secB;
   int     hourBrightness;
   int     minBrightness;
-  int     secBrightness;        // intensità lancetta secondi
-  bool    showSeconds;          // mostra/nascondi lancetta secondi
+  int     secBrightness;
+  bool    showSeconds;
   int     utcOffsetSec;
   int     manualHour;
   int     manualMinute;
   bool    ntpEnabled;
   int     ledDensity;
-  int     mappingMode;  // 0=spread, 1=first60, 2=all-with-gap
-  int     ledModel;     // 0=WS2812B, 1=SK6812
+  int     mappingMode;
+  int     ledModel;
   int     ledOffset;
   int     ledSkip;
   bool    ledReverse;
@@ -100,7 +103,8 @@ void loadConfig() {
   cfg.hourBrightness = prefs.getInt("hBri",        200);
   cfg.minBrightness  = prefs.getInt("mBri",        255);
   cfg.secBrightness  = prefs.getInt("sBri",        160);
-  cfg.showSeconds    = prefs.getBool("showSec",    false); // default off
+  // Default true: al primo avvio i secondi sono visibili (facile capire se il ring funziona)
+  cfg.showSeconds    = prefs.getBool("showSec",    true);
   cfg.utcOffsetSec   = prefs.getInt("utcOff",      DEFAULT_UTC_OFFSET);
   cfg.manualHour     = prefs.getInt("manHour",     -1);
   cfg.manualMinute   = prefs.getInt("manMin",      0);
@@ -166,7 +170,6 @@ int logicalToPhysical(int logical, int totalLeds, int mode, int offset, int skip
   return skip + pos;
 }
 
-// Applica un colore a una posizione fisica con gestione blend se già occupata
 void setLed(int pos, CRGB color, bool blend128 = false) {
   if (pos < cfg.ledSkip || pos >= cfg.ledSkip + cfg.numLeds) return;
   if (blend128) {
@@ -177,12 +180,9 @@ void setLed(int pos, CRGB color, bool blend128 = false) {
 }
 
 // --- Clock rendering ---------------------------------------------------------
-// Ordine di disegno: secondi -> minuti -> ore
-// Le lancette più "importanti" vengono scritte per ultime e vincono
 void renderClock(int hour24, int minute, int second) {
   fill_solid(leds, cfg.ledSkip + cfg.numLeds, CRGB::Black);
 
-  // --- SECONDI (primo strato, più bassa priorità) ---
   if (cfg.showSeconds) {
     int secPos = logicalToPhysical(second % 60, cfg.numLeds, cfg.mappingMode,
                                     cfg.ledOffset, cfg.ledSkip, cfg.ledReverse);
@@ -194,7 +194,6 @@ void renderClock(int hour24, int minute, int second) {
     setLed(secPos, sc);
   }
 
-  // --- MINUTI ---
   int minPos = logicalToPhysical(minute % 60, cfg.numLeds, cfg.mappingMode,
                                   cfg.ledOffset, cfg.ledSkip, cfg.ledReverse);
   CRGB mc(
@@ -202,13 +201,11 @@ void renderClock(int hour24, int minute, int second) {
     (cfg.minG  * cfg.minBrightness)  / 255,
     (cfg.minB  * cfg.minBrightness)  / 255
   );
-  // Se minuti coincide con secondi: blend
   bool minOnSec = (cfg.showSeconds && minPos ==
     logicalToPhysical(second % 60, cfg.numLeds, cfg.mappingMode,
                       cfg.ledOffset, cfg.ledSkip, cfg.ledReverse));
   setLed(minPos, mc, minOnSec);
 
-  // --- ORE ---
   float hourFrac    = (hour24 % 12) * 5.0f + (minute / 12.0f);
   int   hourLogical = (int)round(hourFrac) % 60;
   int   hourPos     = logicalToPhysical(hourLogical, cfg.numLeds, cfg.mappingMode,
@@ -218,7 +215,6 @@ void renderClock(int hour24, int minute, int second) {
     (cfg.hourG * cfg.hourBrightness) / 255,
     (cfg.hourB * cfg.hourBrightness) / 255
   );
-  // Se ore coincide con minuti o secondi: blend
   bool hourOnOther = (hourPos == minPos);
   setLed(hourPos, hc, hourOnOther);
 
@@ -344,7 +340,7 @@ static const char FALLBACK_HTML[] PROGMEM =
 "document.getElementById('sR').value=d.secR||200;document.getElementById('sG').value=d.secG||0;document.getElementById('sB').value=d.secB||0;"
 "document.getElementById('hBri').value=d.hourBrightness;document.getElementById('mBri').value=d.minBrightness;"
 "document.getElementById('sBri').value=d.secBrightness||160;"
-"document.getElementById('showSeconds').checked=d.showSeconds||false;"
+"document.getElementById('showSeconds').checked=d.showSeconds===true;"
 "document.getElementById('utcOff').value=d.utcOffsetSec;"
 "document.getElementById('manH').value=d.manualHour;document.getElementById('manM').value=d.manualMinute;"
 "document.getElementById('mapMode').value=d.mappingMode;"
@@ -352,8 +348,6 @@ static const char FALLBACK_HTML[] PROGMEM =
 "}catch(e){document.getElementById('st').innerHTML=\"<span class='err'>Errore</span>\";}"
 "}"
 "async function save(){"
-"const prevModel=parseInt(document.getElementById('ledModel').dataset.loaded||0);"
-"const newModel=parseInt(document.getElementById('ledModel').value);"
 "const body={ssid:document.getElementById('ssid').value,password:document.getElementById('pass').value,"
 "numLeds:+document.getElementById('numLeds').value,ledSkip:+document.getElementById('ledSkip').value,"
 "ledOffset:+document.getElementById('ledOffset').value,"
@@ -367,14 +361,24 @@ static const char FALLBACK_HTML[] PROGMEM =
 "showSeconds:document.getElementById('showSeconds').checked,"
 "utcOffsetSec:+document.getElementById('utcOff').value,"
 "manualHour:+document.getElementById('manH').value,manualMinute:+document.getElementById('manM').value,"
-"mappingMode:+document.getElementById('mapMode').value,ledModel:newModel};"
+"mappingMode:+document.getElementById('mapMode').value,ledModel:+document.getElementById('ledModel').value};"
 "await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
-"if(newModel!==prevModel){alert('Tipo LED cambiato. Riavvio necessario.');await fetch('/api/reconnect',{method:'POST'});}"
-"else{alert('Salvato!');load();}}"
+"alert('Salvato!');load();}"
 "async function doSyncNTP(){await fetch('/api/syncntp',{method:'POST'});alert('Sync NTP avviato');setTimeout(load,2500);}"
 "async function reboot(){await fetch('/api/reconnect',{method:'POST'});alert('Riavvio...');}"
-"load().then(()=>{const m=document.getElementById('ledModel');m.dataset.loaded=m.value;});"
+"load();"
 "</script></body></html>";
+
+// ---------------------------------------------------------------------------
+// Helper: legge un campo booleano da JsonDocument in modo compatibile
+// con ArduinoJson v6 e v7.
+// In v7, doc[key].is<bool>() può restituire false per booleani JSON nativi;
+// il metodo sicuro è controllare che il campo esista (!isNull()) e castarlo.
+// ---------------------------------------------------------------------------
+static inline bool jsonBool(JsonDocument& doc, const char* key, bool fallback) {
+  if (doc[key].isNull()) return fallback;
+  return (bool)doc[key];
+}
 
 // --- Web server --------------------------------------------------------------
 void setupWebServer() {
@@ -448,39 +452,47 @@ void setupWebServer() {
       bool modelChanged = false;
       if (doc["ssid"].is<const char*>())     strlcpy(cfg.ssid,     doc["ssid"],     sizeof(cfg.ssid));
       if (doc["password"].is<const char*>()) strlcpy(cfg.password, doc["password"], sizeof(cfg.password));
-      if (doc["numLeds"].is<int>())          cfg.numLeds        = constrain((int)doc["numLeds"], 1, MAX_LEDS);
-      if (doc["brightness"].is<int>())       cfg.brightness     = constrain((int)doc["brightness"], 0, 255);
-      if (doc["hourR"].is<int>())            cfg.hourR          = constrain((int)doc["hourR"], 0, 255);
-      if (doc["hourG"].is<int>())            cfg.hourG          = constrain((int)doc["hourG"], 0, 255);
-      if (doc["hourB"].is<int>())            cfg.hourB          = constrain((int)doc["hourB"], 0, 255);
-      if (doc["minR"].is<int>())             cfg.minR           = constrain((int)doc["minR"], 0, 255);
-      if (doc["minG"].is<int>())             cfg.minG           = constrain((int)doc["minG"], 0, 255);
-      if (doc["minB"].is<int>())             cfg.minB           = constrain((int)doc["minB"], 0, 255);
-      if (doc["secR"].is<int>())             cfg.secR           = constrain((int)doc["secR"], 0, 255);
-      if (doc["secG"].is<int>())             cfg.secG           = constrain((int)doc["secG"], 0, 255);
-      if (doc["secB"].is<int>())             cfg.secB           = constrain((int)doc["secB"], 0, 255);
-      if (doc["hourBrightness"].is<int>())   cfg.hourBrightness = constrain((int)doc["hourBrightness"], 0, 255);
-      if (doc["minBrightness"].is<int>())    cfg.minBrightness  = constrain((int)doc["minBrightness"], 0, 255);
-      if (doc["secBrightness"].is<int>())    cfg.secBrightness  = constrain((int)doc["secBrightness"], 0, 255);
-      if (doc["showSeconds"].is<bool>())     cfg.showSeconds    = (bool)doc["showSeconds"];
-      if (doc["utcOffsetSec"].is<int>()) {
+      if (!doc["numLeds"].isNull())          cfg.numLeds        = constrain((int)doc["numLeds"], 1, MAX_LEDS);
+      if (!doc["brightness"].isNull())       cfg.brightness     = constrain((int)doc["brightness"], 0, 255);
+      if (!doc["hourR"].isNull())            cfg.hourR          = constrain((int)doc["hourR"], 0, 255);
+      if (!doc["hourG"].isNull())            cfg.hourG          = constrain((int)doc["hourG"], 0, 255);
+      if (!doc["hourB"].isNull())            cfg.hourB          = constrain((int)doc["hourB"], 0, 255);
+      if (!doc["minR"].isNull())             cfg.minR           = constrain((int)doc["minR"], 0, 255);
+      if (!doc["minG"].isNull())             cfg.minG           = constrain((int)doc["minG"], 0, 255);
+      if (!doc["minB"].isNull())             cfg.minB           = constrain((int)doc["minB"], 0, 255);
+      if (!doc["secR"].isNull())             cfg.secR           = constrain((int)doc["secR"], 0, 255);
+      if (!doc["secG"].isNull())             cfg.secG           = constrain((int)doc["secG"], 0, 255);
+      if (!doc["secB"].isNull())             cfg.secB           = constrain((int)doc["secB"], 0, 255);
+      if (!doc["hourBrightness"].isNull())   cfg.hourBrightness = constrain((int)doc["hourBrightness"], 0, 255);
+      if (!doc["minBrightness"].isNull())    cfg.minBrightness  = constrain((int)doc["minBrightness"], 0, 255);
+      if (!doc["secBrightness"].isNull())    cfg.secBrightness  = constrain((int)doc["secBrightness"], 0, 255);
+
+      // FIX: usare jsonBool() per compatibilita ArduinoJson v6/v7
+      // doc[x].is<bool>() non funziona in v7 per true/false JSON nativi
+      if (!doc["showSeconds"].isNull())  cfg.showSeconds = jsonBool(doc, "showSeconds", cfg.showSeconds);
+      if (!doc["ntpEnabled"].isNull())   cfg.ntpEnabled  = jsonBool(doc, "ntpEnabled",  cfg.ntpEnabled);
+      if (!doc["ledReverse"].isNull())   cfg.ledReverse  = jsonBool(doc, "ledReverse",  cfg.ledReverse);
+
+      if (!doc["utcOffsetSec"].isNull()) {
         int newOff = (int)doc["utcOffsetSec"];
         if (newOff != cfg.utcOffsetSec) { cfg.utcOffsetSec = newOff; utcChanged = true; }
       }
-      if (doc["ntpEnabled"].is<bool>())     cfg.ntpEnabled  = (bool)doc["ntpEnabled"];
-      if (doc["ledDensity"].is<int>())      cfg.ledDensity  = (int)doc["ledDensity"];
-      if (doc["mappingMode"].is<int>())     cfg.mappingMode = constrain((int)doc["mappingMode"], 0, 2);
-      if (doc["manualHour"].is<int>())      cfg.manualHour  = constrain((int)doc["manualHour"], -1, 23);
-      if (doc["manualMinute"].is<int>())    cfg.manualMinute= constrain((int)doc["manualMinute"], 0, 59);
-      if (doc["ledOffset"].is<int>())       cfg.ledOffset   = constrain((int)doc["ledOffset"], 0, MAX_LEDS - 1);
-      if (doc["ledSkip"].is<int>())         cfg.ledSkip     = constrain((int)doc["ledSkip"], 0, 10);
-      if (doc["ledReverse"].is<bool>())     cfg.ledReverse  = (bool)doc["ledReverse"];
-      if (doc["ledModel"].is<int>()) {
+      if (!doc["ledDensity"].isNull())   cfg.ledDensity  = (int)doc["ledDensity"];
+      if (!doc["mappingMode"].isNull())  cfg.mappingMode = constrain((int)doc["mappingMode"], 0, 2);
+      if (!doc["manualHour"].isNull())   cfg.manualHour  = constrain((int)doc["manualHour"], -1, 23);
+      if (!doc["manualMinute"].isNull()) cfg.manualMinute= constrain((int)doc["manualMinute"], 0, 59);
+      if (!doc["ledOffset"].isNull())    cfg.ledOffset   = constrain((int)doc["ledOffset"], 0, MAX_LEDS - 1);
+      if (!doc["ledSkip"].isNull())      cfg.ledSkip     = constrain((int)doc["ledSkip"], 0, 10);
+      if (!doc["ledModel"].isNull()) {
         int newModel = constrain((int)doc["ledModel"], 0, 1);
         if (newModel != cfg.ledModel) { cfg.ledModel = newModel; modelChanged = true; }
       }
       FastLED.setBrightness(cfg.brightness);
       saveConfig();
+
+      DBG.printf("Config aggiornata: showSec=%d ntpEn=%d ledRev=%d\n",
+        cfg.showSeconds, cfg.ntpEnabled, cfg.ledReverse);
+
       if (utcChanged && wifiConnected && cfg.ntpEnabled) syncNTP();
       req->send(200, "application/json", modelChanged ?
         "{\"ok\":true,\"rebootRequired\":true}" :
@@ -533,7 +545,6 @@ void setup() {
 
   setupWebServer();
 
-  // Startup sweep
   for (int i = 0; i < cfg.numLeds; i++) {
     fill_solid(leds, MAX_LEDS, CRGB::Black);
     leds[cfg.ledSkip + i] = CRGB(0, 50, 80);

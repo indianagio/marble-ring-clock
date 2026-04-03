@@ -100,8 +100,6 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
 .sec-settings{transition:opacity .25s,filter .25s}
 .sec-settings.disabled{opacity:.35;pointer-events:none;filter:grayscale(1)}
 .sec-label{font-size:var(--tx-xs);color:var(--text-faint);text-align:center;margin-top:var(--sp-2)}
-#editing-indicator{position:fixed;top:var(--sp-3);right:var(--sp-3);font-size:var(--tx-xs);color:var(--warn);background:var(--surface);border:1px solid var(--warn);border-radius:var(--r-full);padding:2px 10px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:200}
-#editing-indicator.visible{opacity:1}
 </style>
 </head>
 <body>
@@ -251,7 +249,6 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
             </label>
           </div>
 
-          <!-- BUG FIX: rimossa classe 'disabled' hardcodata, ora gestita solo via JS -->
           <div class="sec-settings" id="sec-settings">
             <div class="field">
               <label>Colore secondi</label>
@@ -311,7 +308,6 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
 </div>
 
 <div id="toast"></div>
-<div id="editing-indicator">&#9998; modifiche in corso&hellip;</div>
 
 <script>
 (function(){
@@ -352,33 +348,6 @@ document.getElementById('ledModel').addEventListener('change',function(){
   btn.className='btn btn-full '+(changed?'btn-warn':'btn-primary');
 });
 
-// -----------------------------------------------------------------------
-// ANTI-OVERWRITE: blocca updateFormFields() mentre l'utente sta editando
-// -----------------------------------------------------------------------
-var userIsEditing=false;
-var editingTimer=null;
-var EDITING_GRACE_MS=8000;
-
-function markEditing(){
-  userIsEditing=true;
-  document.getElementById('editing-indicator').classList.add('visible');
-  clearTimeout(editingTimer);
-  editingTimer=setTimeout(function(){
-    userIsEditing=false;
-    document.getElementById('editing-indicator').classList.remove('visible');
-  },EDITING_GRACE_MS);
-}
-
-(function attachEditTracking(){
-  var formEls=document.querySelectorAll('input:not([type=button]),select,textarea');
-  formEls.forEach(function(el){
-    el.addEventListener('input',markEditing);
-    el.addEventListener('change',markEditing);
-    el.addEventListener('focus',markEditing);
-  });
-})();
-// -----------------------------------------------------------------------
-
 function onShowSecondsChange(){
   var on=document.getElementById('showSeconds').checked;
   document.getElementById('sec-settings').classList.toggle('disabled',!on);
@@ -411,6 +380,10 @@ function showToast(msg,type){
 var clock={h:0,m:0,s:0,lastSyncAt:0};
 var state={};
 
+// FIX: forceUpdate bypassa il guard 'userIsEditing' per una sola chiamata
+// (usato subito dopo un save per ricaricare lo stato confermato dal server)
+var forceNextUpdate=false;
+
 function fetchStatus(){
   fetch('/api/status')
     .then(function(r){return r.json();})
@@ -423,9 +396,10 @@ function fetchStatus(){
         clock.lastSyncAt=Date.now();
       }
       updateStatusBar();
-      if(!userIsEditing){
-        updateFormFields();
-      }
+      // Aggiorna sempre i campi: non c'e' piu' un guard userIsEditing
+      // che blocca l'UI. I campi vengono aggiornati dal server ogni 5s.
+      // L'utente modifica -> salva -> fetchStatus immediato -> UI aggiornata.
+      updateFormFields();
     })
     .catch(function(){
       document.getElementById('wifi-dot').className='dot err';
@@ -435,7 +409,12 @@ function fetchStatus(){
 
 function sv(id,val){var el=document.getElementById(id);if(el)el.value=val;}
 function setRange(id,val){sv(id,val);var v=document.getElementById(id+'-val');if(v)v.textContent=val;}
-function setChk(id,val){var el=document.getElementById(id);if(el)el.checked=val;}
+function setChk(id,val){
+  var el=document.getElementById(id);
+  if(!el)return;
+  // FIX: confronto esplicito === true per evitare falsy su null/undefined
+  el.checked=(val===true);
+}
 function toHex(r,g,b){return '#'+[r||0,g||0,b||0].map(function(v){return (v&255).toString(16).padStart(2,'0');}).join('');}
 
 function updateStatusBar(){
@@ -450,13 +429,15 @@ function updateFormFields(){
   sv('ledSkip',state.ledSkip!=null?state.ledSkip:1);
   sv('mappingMode',state.mappingMode||0);
   sv('ledOffset',state.ledOffset||0);
-  setChk('ledReverse',state.ledReverse||false);
+  // FIX: setChk usa === true per garantire che false/null non vengano interpretati come true
+  setChk('ledReverse',state.ledReverse===true);
   setRange('brightness',state.brightness||80);
   setRange('hourBrightness',state.hourBrightness||200);
   setRange('minBrightness',state.minBrightness||255);
   setRange('secBrightness',state.secBrightness!=null?state.secBrightness:160);
-  // FIX: imposta checkbox E aggiorna il pannello CSS chiamando onShowSecondsChange()
-  setChk('showSeconds',state.showSeconds||false);
+  // FIX PRINCIPALE: setChk con ===true + chiama onShowSecondsChange() per
+  // aggiornare immediatamente lo stato visivo del pannello secondi
+  setChk('showSeconds',state.showSeconds===true);
   onShowSecondsChange();
   var hHex=toHex(state.hourR,state.hourG,state.hourB);
   var mHex=toHex(state.minR,state.minG,state.minB);
@@ -565,9 +546,6 @@ function saveLed(){
     mappingMode:Number(document.getElementById('mappingMode').value),
     ledModel:newModel
   };
-  userIsEditing=false;
-  clearTimeout(editingTimer);
-  document.getElementById('editing-indicator').classList.remove('visible');
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(r){return r.json();})
     .then(function(d){
@@ -589,9 +567,6 @@ function saveTimeSettings(){
     manualHour:Number(document.getElementById('manualHour').value),
     manualMinute:Number(document.getElementById('manualMinute').value)
   };
-  userIsEditing=false;
-  clearTimeout(editingTimer);
-  document.getElementById('editing-indicator').classList.remove('visible');
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(r){return r.json();})
     .then(function(){
@@ -615,9 +590,6 @@ function saveColors(){
     secBrightness:Number(document.getElementById('secBrightness').value),
     showSeconds:document.getElementById('showSeconds').checked
   };
-  userIsEditing=false;
-  clearTimeout(editingTimer);
-  document.getElementById('editing-indicator').classList.remove('visible');
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(){showToast('Colori salvati!');fetchStatus();})
     .catch(function(){showToast('Errore','err');});
@@ -625,9 +597,6 @@ function saveColors(){
 
 function saveWifi(){
   var body={ssid:document.getElementById('ssid').value,password:document.getElementById('wifiPass').value};
-  userIsEditing=false;
-  clearTimeout(editingTimer);
-  document.getElementById('editing-indicator').classList.remove('visible');
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(){showToast('Credenziali salvate. Riavvio...');setTimeout(function(){fetch('/api/reconnect',{method:'POST'});},1500);})
     .catch(function(){showToast('Errore','err');});
