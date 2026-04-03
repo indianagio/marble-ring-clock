@@ -2,9 +2,8 @@
  * Marble Ring Clock — ESP32
  * WS2812B LED ring clock with NTP sync and web configuration
  *
- * Supported boards:
- *   - Lolin32 Lite  → DATA_PIN 22 (default)
- *   - ESP32-C3 Mini → DATA_PIN 8  (set via -DDATA_PIN_OVERRIDE=8 in platformio.ini)
+ * Board: ESP32-C3 Mini (esp32c3mini in platformio.ini)
+ * Anche compatibile con Lolin32 Lite cambiando environment
  *
  * Libraries:
  *   FastLED, ESPAsyncWebServer-esphome, AsyncTCP-esphome,
@@ -12,17 +11,6 @@
  */
 
 #include <Arduino.h>
-
-// ─── Serial: su C3 con USB-CDC occorre includere USB.h ───────────────────────
-#if defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE == 1
-  // ESP32-C3/S3 con USB-CDC nativo abilitato
-  #include <USB.h>
-  #define DBG USBSerial
-#else
-  // ESP32 classico (Lolin32 Lite, ecc.) — Serial hardware UART0
-  #define DBG Serial
-#endif
-
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
@@ -33,21 +21,26 @@
 #include <Preferences.h>
 #include <ArduinoOTA.h>
 
+// ─── Serial ──────────────────────────────────────────────────────────────────
+// Serial0 e' l'alias corretto per UART0/USB-CDC su arduino-esp32 v3.x
+// Funziona su ESP32-C3 (con CDC), ESP32-S3 e ESP32 classico (Lolin32 Lite)
+#define DBG Serial0
+
 // ─── Pin & LED defaults ──────────────────────────────────────────────────────
 #ifndef DATA_PIN_OVERRIDE
-  #define DATA_PIN 22   // Lolin32 Lite default
+  #define DATA_PIN 8    // ESP32-C3 Mini default (GPIO8)
 #else
   #define DATA_PIN DATA_PIN_OVERRIDE
 #endif
 
-#define MAX_LEDS         200
-#define DEFAULT_NUM_LEDS  70
+#define MAX_LEDS          200
+#define DEFAULT_NUM_LEDS   70
 #define DEFAULT_BRIGHTNESS 80
-#define LED_TYPE         WS2812B
-#define COLOR_ORDER      GRB
+#define LED_TYPE          WS2812B
+#define COLOR_ORDER       GRB
 
 // ─── NTP ─────────────────────────────────────────────────────────────────────
-#define NTP_SERVER       "pool.ntp.org"
+#define NTP_SERVER        "pool.ntp.org"
 #define DEFAULT_UTC_OFFSET 3600  // UTC+1 CET
 
 // ─── Oggetti globali ─────────────────────────────────────────────────────────
@@ -68,11 +61,11 @@ struct Config {
   int     hourBrightness;
   int     minBrightness;
   int     utcOffsetSec;
-  int     manualHour;     // -1 = usa NTP
+  int     manualHour;    // -1 = usa NTP
   int     manualMinute;
   bool    ntpEnabled;
   int     ledDensity;
-  int     mappingMode;    // 0=distribuiti, 1=primi 60, 2=tutti con gap
+  int     mappingMode;   // 0=distribuiti, 1=primi 60, 2=tutti con gap
 } cfg;
 
 // ─── Stato runtime ───────────────────────────────────────────────────────────
@@ -84,47 +77,47 @@ unsigned long lastUpdate  = 0;
 // ─── Persistenza config ──────────────────────────────────────────────────────
 void loadConfig() {
   prefs.begin("clock", true);
-  strlcpy(cfg.ssid,     prefs.getString("ssid",     "").c_str(), sizeof(cfg.ssid));
-  strlcpy(cfg.password, prefs.getString("pass",     "").c_str(), sizeof(cfg.password));
-  cfg.numLeds        = prefs.getInt("numLeds",    DEFAULT_NUM_LEDS);
-  cfg.brightness     = prefs.getInt("bri",        DEFAULT_BRIGHTNESS);
-  cfg.hourR          = prefs.getUChar("hR",        255);
-  cfg.hourG          = prefs.getUChar("hG",        80);
-  cfg.hourB          = prefs.getUChar("hB",        0);
-  cfg.minR           = prefs.getUChar("mR",        0);
-  cfg.minG           = prefs.getUChar("mG",        180);
-  cfg.minB           = prefs.getUChar("mB",        255);
-  cfg.hourBrightness = prefs.getInt("hBri",        200);
-  cfg.minBrightness  = prefs.getInt("mBri",        255);
-  cfg.utcOffsetSec   = prefs.getInt("utcOff",      DEFAULT_UTC_OFFSET);
-  cfg.manualHour     = prefs.getInt("manHour",     -1);
-  cfg.manualMinute   = prefs.getInt("manMin",      0);
-  cfg.ntpEnabled     = prefs.getBool("ntpEn",      true);
-  cfg.ledDensity     = prefs.getInt("density",     60);
-  cfg.mappingMode    = prefs.getInt("mapMode",     0);
+  strlcpy(cfg.ssid,     prefs.getString("ssid", "").c_str(), sizeof(cfg.ssid));
+  strlcpy(cfg.password, prefs.getString("pass", "").c_str(), sizeof(cfg.password));
+  cfg.numLeds        = prefs.getInt("numLeds",   DEFAULT_NUM_LEDS);
+  cfg.brightness     = prefs.getInt("bri",       DEFAULT_BRIGHTNESS);
+  cfg.hourR          = prefs.getUChar("hR",       255);
+  cfg.hourG          = prefs.getUChar("hG",       80);
+  cfg.hourB          = prefs.getUChar("hB",       0);
+  cfg.minR           = prefs.getUChar("mR",       0);
+  cfg.minG           = prefs.getUChar("mG",       180);
+  cfg.minB           = prefs.getUChar("mB",       255);
+  cfg.hourBrightness = prefs.getInt("hBri",       200);
+  cfg.minBrightness  = prefs.getInt("mBri",       255);
+  cfg.utcOffsetSec   = prefs.getInt("utcOff",     DEFAULT_UTC_OFFSET);
+  cfg.manualHour     = prefs.getInt("manHour",    -1);
+  cfg.manualMinute   = prefs.getInt("manMin",     0);
+  cfg.ntpEnabled     = prefs.getBool("ntpEn",     true);
+  cfg.ledDensity     = prefs.getInt("density",    60);
+  cfg.mappingMode    = prefs.getInt("mapMode",    0);
   prefs.end();
 }
 
 void saveConfig() {
   prefs.begin("clock", false);
-  prefs.putString("ssid",    cfg.ssid);
-  prefs.putString("pass",    cfg.password);
-  prefs.putInt("numLeds",    cfg.numLeds);
-  prefs.putInt("bri",        cfg.brightness);
-  prefs.putUChar("hR",       cfg.hourR);
-  prefs.putUChar("hG",       cfg.hourG);
-  prefs.putUChar("hB",       cfg.hourB);
-  prefs.putUChar("mR",       cfg.minR);
-  prefs.putUChar("mG",       cfg.minG);
-  prefs.putUChar("mB",       cfg.minB);
-  prefs.putInt("hBri",       cfg.hourBrightness);
-  prefs.putInt("mBri",       cfg.minBrightness);
-  prefs.putInt("utcOff",     cfg.utcOffsetSec);
-  prefs.putInt("manHour",    cfg.manualHour);
-  prefs.putInt("manMin",     cfg.manualMinute);
-  prefs.putBool("ntpEn",     cfg.ntpEnabled);
-  prefs.putInt("density",    cfg.ledDensity);
-  prefs.putInt("mapMode",    cfg.mappingMode);
+  prefs.putString("ssid",  cfg.ssid);
+  prefs.putString("pass",  cfg.password);
+  prefs.putInt("numLeds",  cfg.numLeds);
+  prefs.putInt("bri",      cfg.brightness);
+  prefs.putUChar("hR",     cfg.hourR);
+  prefs.putUChar("hG",     cfg.hourG);
+  prefs.putUChar("hB",     cfg.hourB);
+  prefs.putUChar("mR",     cfg.minR);
+  prefs.putUChar("mG",     cfg.minG);
+  prefs.putUChar("mB",     cfg.minB);
+  prefs.putInt("hBri",     cfg.hourBrightness);
+  prefs.putInt("mBri",     cfg.minBrightness);
+  prefs.putInt("utcOff",   cfg.utcOffsetSec);
+  prefs.putInt("manHour",  cfg.manualHour);
+  prefs.putInt("manMin",   cfg.manualMinute);
+  prefs.putBool("ntpEn",   cfg.ntpEnabled);
+  prefs.putInt("density",  cfg.ledDensity);
+  prefs.putInt("mapMode",  cfg.mappingMode);
   prefs.end();
 }
 
@@ -166,7 +159,6 @@ void renderClock(int hour24, int minute) {
       (cfg.hourB * cfg.hourBrightness) / 255
     );
     if (hourPos == minPos) {
-      // Sovrapposizione: blend 50/50
       leds[hourPos] = blend(hc, leds[minPos], 128);
     } else {
       leds[hourPos] = hc;
@@ -226,29 +218,29 @@ void setupWebServer() {
   // GET /api/status
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *req) {
     JsonDocument doc;
-    doc["hour"]          = timeClient.getHours();
-    doc["minute"]        = timeClient.getMinutes();
-    doc["second"]        = timeClient.getSeconds();
-    doc["ntpSynced"]     = ntpSynced;
-    doc["wifiConnected"] = wifiConnected;
-    doc["ip"]            = WiFi.localIP().toString();
-    doc["ssid"]          = cfg.ssid;
-    doc["numLeds"]       = cfg.numLeds;
-    doc["brightness"]    = cfg.brightness;
-    doc["hourR"]         = cfg.hourR;
-    doc["hourG"]         = cfg.hourG;
-    doc["hourB"]         = cfg.hourB;
-    doc["minR"]          = cfg.minR;
-    doc["minG"]          = cfg.minG;
-    doc["minB"]          = cfg.minB;
-    doc["hourBrightness"]= cfg.hourBrightness;
-    doc["minBrightness"] = cfg.minBrightness;
-    doc["utcOffsetSec"]  = cfg.utcOffsetSec;
-    doc["ntpEnabled"]    = cfg.ntpEnabled;
-    doc["ledDensity"]    = cfg.ledDensity;
-    doc["mappingMode"]   = cfg.mappingMode;
-    doc["manualHour"]    = cfg.manualHour;
-    doc["manualMinute"]  = cfg.manualMinute;
+    doc["hour"]           = timeClient.getHours();
+    doc["minute"]         = timeClient.getMinutes();
+    doc["second"]         = timeClient.getSeconds();
+    doc["ntpSynced"]      = ntpSynced;
+    doc["wifiConnected"]  = wifiConnected;
+    doc["ip"]             = WiFi.localIP().toString();
+    doc["ssid"]           = cfg.ssid;
+    doc["numLeds"]        = cfg.numLeds;
+    doc["brightness"]     = cfg.brightness;
+    doc["hourR"]          = cfg.hourR;
+    doc["hourG"]          = cfg.hourG;
+    doc["hourB"]          = cfg.hourB;
+    doc["minR"]           = cfg.minR;
+    doc["minG"]           = cfg.minG;
+    doc["minB"]           = cfg.minB;
+    doc["hourBrightness"] = cfg.hourBrightness;
+    doc["minBrightness"]  = cfg.minBrightness;
+    doc["utcOffsetSec"]   = cfg.utcOffsetSec;
+    doc["ntpEnabled"]     = cfg.ntpEnabled;
+    doc["ledDensity"]     = cfg.ledDensity;
+    doc["mappingMode"]    = cfg.mappingMode;
+    doc["manualHour"]     = cfg.manualHour;
+    doc["manualMinute"]   = cfg.manualMinute;
     String json;
     serializeJson(doc, json);
     req->send(200, "application/json", json);
@@ -294,7 +286,7 @@ void setupWebServer() {
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
-  // POST /api/reconnect — salva e riavvia
+  // POST /api/reconnect — riavvia ESP
   server.on("/api/reconnect", HTTP_POST, [](AsyncWebServerRequest *req) {
     req->send(200, "application/json", "{\"ok\":true}");
     delay(200);
@@ -314,14 +306,12 @@ void setup() {
 
   loadConfig();
 
-  // Init FastLED
   FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, MAX_LEDS)
          .setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(cfg.brightness);
   fill_solid(leds, cfg.numLeds, CRGB::Black);
   FastLED.show();
 
-  // Init LittleFS
   if (!LittleFS.begin(true)) {
     DBG.println("LittleFS mount failed!");
   } else {
@@ -336,7 +326,7 @@ void setup() {
 
   setupWebServer();
 
-  // Animazione di avvio: sweep
+  // Animazione avvio: sweep
   for (int i = 0; i < cfg.numLeds; i++) {
     fill_solid(leds, cfg.numLeds, CRGB::Black);
     leds[i] = CRGB(0, 50, 80);
