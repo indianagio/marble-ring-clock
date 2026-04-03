@@ -1,20 +1,14 @@
 /*
- * Marble Ring Clock — ESP32
+ * Marble Ring Clock - ESP32
  * WS2812B / SK6812 LED ring clock with NTP sync and web configuration
  *
  * Board: Lolin32 Lite (target) / ESP32-C3 Mini (test)
  *
- * Note SK6812: FastLED 3.9+ ha rimosso CRGBW. Usiamo un buffer CRGB
- * per i primi 3 canali e un array raw uint8_t per il canale W (bianco).
- * FastLED.show() usa solo il buffer CRGB; il canale W viene iniettato
- * direttamente nel buffer SPI via CLEDController::setRawData (non serve).
- * Approccio scelto: W=0 sempre (SK6812 usato come RGB puro, canale W spento).
- * Questo è il comportamento più semplice e corretto per un orologio a colori.
- * Se vuoi il bianco puro, imposta R=G=B=0 e usa l'API /api/config con un
- * parametro futuro "whiteChannel". Per ora W=0.
+ * SK6812 note: FastLED 3.9+ removed CRGBW. We use a single CRGB buffer;
+ * the SK6812 controller transmits W=0 automatically.
  *
  * Libraries:
- *   FastLED >= 3.9, ESPAsyncWebServer-esphome, AsyncTCP-esphome,
+ *   FastLED >=3.9, ESPAsyncWebServer-esphome, AsyncTCP-esphome,
  *   NTPClient, ArduinoJson, LittleFS, Preferences, ArduinoOTA
  */
 
@@ -29,29 +23,26 @@
 #include <Preferences.h>
 #include <ArduinoOTA.h>
 
-// ─── Serial ──────────────────────────────────────────────────────────────────
+// --- Serial ------------------------------------------------------------------
 #define DBG Serial0
 
-// ─── Pin ─────────────────────────────────────────────────────────────────────
+// --- Pin ---------------------------------------------------------------------
 #ifndef DATA_PIN_OVERRIDE
   #define DATA_PIN 5    // Lolin32 Lite default (GPIO5)
 #else
   #define DATA_PIN DATA_PIN_OVERRIDE
 #endif
 
-// ─── LED constants ───────────────────────────────────────────────────────────
-#define MAX_LEDS          200
-#define DEFAULT_NUM_LEDS   70
+// --- LED constants -----------------------------------------------------------
+#define MAX_LEDS           200
+#define DEFAULT_NUM_LEDS    70
 #define DEFAULT_BRIGHTNESS  80
 
-// ─── NTP ─────────────────────────────────────────────────────────────────────
-#define NTP_SERVER        "pool.ntp.org"
-#define DEFAULT_UTC_OFFSET 3600  // UTC+1 CET
+// --- NTP ---------------------------------------------------------------------
+#define NTP_SERVER         "pool.ntp.org"
+#define DEFAULT_UTC_OFFSET  3600  // UTC+1 CET
 
-// ─── Oggetti globali ─────────────────────────────────────────────────────────
-// Un solo buffer CRGB — funziona sia per WS2812B che SK6812 (W=0).
-// SK6812 in FastLED 3.9+: si usa SK6812 come tipo, il 4° byte (W) viene
-// trasmesso come 0x00 automaticamente dal controller SK6812.
+// --- Global objects ----------------------------------------------------------
 CRGB leds[MAX_LEDS];
 
 Preferences    prefs;
@@ -59,7 +50,7 @@ AsyncWebServer server(80);
 WiFiUDP        ntpUDP;
 NTPClient      timeClient(ntpUDP, NTP_SERVER);
 
-// ─── Struttura configurazione ────────────────────────────────────────────────
+// --- Config struct -----------------------------------------------------------
 struct Config {
   char    ssid[64];
   char    password[64];
@@ -70,43 +61,43 @@ struct Config {
   int     hourBrightness;
   int     minBrightness;
   int     utcOffsetSec;
-  int     manualHour;    // -1 = usa NTP
+  int     manualHour;   // -1 = use NTP
   int     manualMinute;
   bool    ntpEnabled;
   int     ledDensity;
-  int     mappingMode;   // 0=distribuiti, 1=primi60, 2=tutti con gap
-  int     ledModel;      // 0=WS2812B, 1=SK6812
+  int     mappingMode;  // 0=spread, 1=first60, 2=all-with-gap
+  int     ledModel;     // 0=WS2812B, 1=SK6812
 } cfg;
 
-// ─── Stato runtime ───────────────────────────────────────────────────────────
+// --- Runtime state -----------------------------------------------------------
 bool wifiConnected = false;
 bool ntpSynced     = false;
 bool littlefsOK    = false;
 unsigned long lastNTPSync = 0;
 unsigned long lastUpdate  = 0;
 
-// ─── Persistenza config ──────────────────────────────────────────────────────
+// --- Config persistence ------------------------------------------------------
 void loadConfig() {
   prefs.begin("clock", true);
   strlcpy(cfg.ssid,     prefs.getString("ssid", "").c_str(), sizeof(cfg.ssid));
   strlcpy(cfg.password, prefs.getString("pass", "").c_str(), sizeof(cfg.password));
-  cfg.numLeds        = prefs.getInt("numLeds",   DEFAULT_NUM_LEDS);
-  cfg.brightness     = prefs.getInt("bri",       DEFAULT_BRIGHTNESS);
-  cfg.hourR          = prefs.getUChar("hR",       255);
-  cfg.hourG          = prefs.getUChar("hG",       80);
-  cfg.hourB          = prefs.getUChar("hB",       0);
-  cfg.minR           = prefs.getUChar("mR",       0);
-  cfg.minG           = prefs.getUChar("mG",       180);
-  cfg.minB           = prefs.getUChar("mB",       255);
-  cfg.hourBrightness = prefs.getInt("hBri",       200);
-  cfg.minBrightness  = prefs.getInt("mBri",       255);
-  cfg.utcOffsetSec   = prefs.getInt("utcOff",     DEFAULT_UTC_OFFSET);
-  cfg.manualHour     = prefs.getInt("manHour",    -1);
-  cfg.manualMinute   = prefs.getInt("manMin",     0);
-  cfg.ntpEnabled     = prefs.getBool("ntpEn",     true);
-  cfg.ledDensity     = prefs.getInt("density",    60);
-  cfg.mappingMode    = prefs.getInt("mapMode",    0);
-  cfg.ledModel       = prefs.getInt("ledModel",   0);
+  cfg.numLeds        = prefs.getInt("numLeds",  DEFAULT_NUM_LEDS);
+  cfg.brightness     = prefs.getInt("bri",      DEFAULT_BRIGHTNESS);
+  cfg.hourR          = prefs.getUChar("hR",      255);
+  cfg.hourG          = prefs.getUChar("hG",      80);
+  cfg.hourB          = prefs.getUChar("hB",      0);
+  cfg.minR           = prefs.getUChar("mR",      0);
+  cfg.minG           = prefs.getUChar("mG",      180);
+  cfg.minB           = prefs.getUChar("mB",      255);
+  cfg.hourBrightness = prefs.getInt("hBri",      200);
+  cfg.minBrightness  = prefs.getInt("mBri",      255);
+  cfg.utcOffsetSec   = prefs.getInt("utcOff",    DEFAULT_UTC_OFFSET);
+  cfg.manualHour     = prefs.getInt("manHour",   -1);
+  cfg.manualMinute   = prefs.getInt("manMin",    0);
+  cfg.ntpEnabled     = prefs.getBool("ntpEn",    true);
+  cfg.ledDensity     = prefs.getInt("density",   60);
+  cfg.mappingMode    = prefs.getInt("mapMode",   0);
+  cfg.ledModel       = prefs.getInt("ledModel",  0);
   prefs.end();
 }
 
@@ -134,7 +125,7 @@ void saveConfig() {
   prefs.end();
 }
 
-// ─── LED mapping ─────────────────────────────────────────────────────────────
+// --- LED mapping -------------------------------------------------------------
 int logicalToPhysical(int logical, int totalLeds, int mode) {
   if (totalLeds <= 0) return 0;
   switch (mode) {
@@ -147,11 +138,11 @@ int logicalToPhysical(int logical, int totalLeds, int mode) {
   }
 }
 
-// ─── Rendering orologio ──────────────────────────────────────────────────────
+// --- Clock rendering ---------------------------------------------------------
 void renderClock(int hour24, int minute) {
   fill_solid(leds, cfg.numLeds, CRGB::Black);
 
-  // Lancetta minuti
+  // Minute hand
   int minPos = logicalToPhysical(minute % 60, cfg.numLeds, cfg.mappingMode);
   CRGB mc(
     (cfg.minR  * cfg.minBrightness) / 255,
@@ -160,7 +151,7 @@ void renderClock(int hour24, int minute) {
   );
   if (minPos >= 0 && minPos < cfg.numLeds) leds[minPos] = mc;
 
-  // Lancetta ore (progredisce tra i minuti)
+  // Hour hand (interpolated between minute marks)
   float hourFrac    = (hour24 % 12) * 5.0f + (minute / 12.0f);
   int   hourLogical = (int)round(hourFrac) % 60;
   int   hourPos     = logicalToPhysical(hourLogical, cfg.numLeds, cfg.mappingMode);
@@ -170,20 +161,16 @@ void renderClock(int hour24, int minute) {
     (cfg.hourB * cfg.hourBrightness) / 255
   );
   if (hourPos >= 0 && hourPos < cfg.numLeds) {
-    if (hourPos == minPos) {
-      leds[hourPos] = blend(hc, mc, 128);
-    } else {
-      leds[hourPos] = hc;
-    }
+    leds[hourPos] = (hourPos == minPos) ? blend(hc, mc, 128) : hc;
   }
 
   FastLED.show();
 }
 
-// ─── WiFi ─────────────────────────────────────────────────────────────────────
+// --- WiFi --------------------------------------------------------------------
 void connectWiFi() {
   if (strlen(cfg.ssid) == 0) {
-    DBG.println("No SSID -> AP mode");
+    DBG.println("No SSID - starting AP mode");
     WiFi.mode(WIFI_AP);
     WiFi.softAP("MarbleClock", "clock1234");
     DBG.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
@@ -198,117 +185,146 @@ void connectWiFi() {
   }
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
-    DBG.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
+    DBG.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
   } else {
-    DBG.println("\nFailed -> AP mode");
+    DBG.println("\nWiFi failed - AP mode");
     WiFi.mode(WIFI_AP);
     WiFi.softAP("MarbleClock", "clock1234");
     DBG.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
   }
 }
 
-// ─── NTP ─────────────────────────────────────────────────────────────────────
+// --- NTP ---------------------------------------------------------------------
 void syncNTP() {
   if (!wifiConnected || !cfg.ntpEnabled) return;
   timeClient.setTimeOffset(cfg.utcOffsetSec);
   timeClient.begin();
   if (timeClient.forceUpdate()) {
-    ntpSynced = true; lastNTPSync = millis();
+    ntpSynced = true;
+    lastNTPSync = millis();
     DBG.printf("NTP: %s\n", timeClient.getFormattedTime().c_str());
   } else {
-    DBG.println("NTP failed");
+    DBG.println("NTP sync failed");
   }
 }
 
-// ─── HTML inline fallback ────────────────────────────────────────────────────
-// Servito se LittleFS non e' montato o index.html manca.
-// Permette di configurare WiFi anche senza uploadfs.
-static const char FALLBACK_HTML[] PROGMEM = R"rawhtml(
-<!DOCTYPE html><html><head><meta charset='utf-8'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Marble Clock</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:sans-serif;background:#111;color:#eee;padding:20px}
-h1{color:#4fc3f7;margin-bottom:20px}h2{color:#aaa;margin:16px 0 8px}
-input,select{width:100%;padding:8px;margin:4px 0 12px;background:#222;border:1px solid #444;color:#eee;border-radius:6px}
-button{padding:10px 20px;background:#01696f;color:#fff;border:none;border-radius:6px;cursor:pointer;width:100%;margin:4px 0}
-button:hover{background:#0c4e54}
-.row{display:flex;gap:8px}.row input{flex:1}
-.status{background:#1a1a1a;border-radius:8px;padding:12px;margin-bottom:16px;font-size:14px}
-.ok{color:#6daa45}.err{color:#dd6974}
-</style></head><body>
-<h1>&#9679; Marble Clock</h1>
-<div class='status' id='st'>Caricamento...</div>
-<h2>WiFi</h2>
-<input id='ssid' placeholder='SSID'>
-<input id='pass' type='password' placeholder='Password'>
-<h2>LED</h2>
-<label>Tipo LED</label>
-<select id='ledModel'><option value='0'>WS2812B</option><option value='1'>SK6812 (RGBW)</option></select>
-<label>Numero LED</label><input id='numLeds' type='number' min='1' max='200'>
-<label>Luminosita globale (0-255)</label><input id='brightness' type='range' min='0' max='255'>
-<h2>Colore Ore</h2>
-<div class='row'><input id='hR' type='number' min='0' max='255' placeholder='R'><input id='hG' type='number' min='0' max='255' placeholder='G'><input id='hB' type='number' min='0' max='255' placeholder='B'></div>
-<label>Intensita lancetta ore</label><input id='hBri' type='range' min='0' max='255'>
-<h2>Colore Minuti</h2>
-<div class='row'><input id='mR' type='number' min='0' max='255' placeholder='R'><input id='mG' type='number' min='0' max='255' placeholder='G'><input id='mB' type='number' min='0' max='255' placeholder='B'></div>
-<label>Intensita lancetta minuti</label><input id='mBri' type='range' min='0' max='255'>
-<h2>Orario</h2>
-<label>Fuso orario (secondi UTC, es. 3600=CET)</label>
-<input id='utcOff' type='number'>
-<label>Ora manuale (-1 = usa NTP)</label>
-<div class='row'><input id='manH' type='number' min='-1' max='23' placeholder='Ora'><input id='manM' type='number' min='0' max='59' placeholder='Min'></div>
-<h2>Mapping LED</h2>
-<select id='mapMode'><option value='0'>Distribuiti (consigliato)</option><option value='1'>Primi 60</option><option value='2'>Tutti con gap</option></select>
-<br><br>
-<button onclick='save()'>&#128190; Salva &amp; Applica</button>
-<button onclick='syncNTP()'>&#128337; Sync NTP</button>
-<button onclick='reboot()'>&#128260; Riavvia</button>
-<script>
-async function load(){
-  try{
-    const r=await fetch('/api/status');const d=await r.json();
-    document.getElementById('st').innerHTML=
-      `WiFi: <span class='${d.wifiConnected?"ok":"err"}'>${d.wifiConnected?d.ssid+' ('+d.ip+')':'non connesso'}</span> | NTP: <span class='${d.ntpSynced?"ok":"err"}'>${d.ntpSynced?d.hour+':'+String(d.minute).padStart(2,'0'):'non sync'}</span>`;
-    document.getElementById('ssid').value=d.ssid||'';
-    document.getElementById('numLeds').value=d.numLeds;
-    document.getElementById('brightness').value=d.brightness;
-    document.getElementById('hR').value=d.hourR;document.getElementById('hG').value=d.hourG;document.getElementById('hB').value=d.hourB;
-    document.getElementById('mR').value=d.minR;document.getElementById('mG').value=d.minG;document.getElementById('mB').value=d.minB;
-    document.getElementById('hBri').value=d.hourBrightness;
-    document.getElementById('mBri').value=d.minBrightness;
-    document.getElementById('utcOff').value=d.utcOffsetSec;
-    document.getElementById('manH').value=d.manualHour;
-    document.getElementById('manM').value=d.manualMinute;
-    document.getElementById('mapMode').value=d.mappingMode;
-    document.getElementById('ledModel').value=d.ledModel||0;
-  }catch(e){document.getElementById('st').innerHTML="<span class='err'>Errore connessione</span>";}
-}
-async function save(){
-  const body={ssid:document.getElementById('ssid').value,password:document.getElementById('pass').value,
-    numLeds:+document.getElementById('numLeds').value,brightness:+document.getElementById('brightness').value,
-    hourR:+document.getElementById('hR').value,hourG:+document.getElementById('hG').value,hourB:+document.getElementById('hB').value,
-    minR:+document.getElementById('mR').value,minG:+document.getElementById('mG').value,minB:+document.getElementById('mB').value,
-    hourBrightness:+document.getElementById('hBri').value,minBrightness:+document.getElementById('mBri').value,
-    utcOffsetSec:+document.getElementById('utcOff').value,
-    manualHour:+document.getElementById('manH').value,manualMinute:+document.getElementById('manM').value,
-    mappingMode:+document.getElementById('mapMode').value,ledModel:+document.getElementById('ledModel').value};
-  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  alert('Salvato! Riavvia per applicare cambio tipo LED.');
-}
-async function syncNTP(){await fetch('/api/syncntp',{method:'POST'});alert('NTP sync avviato');}
-async function reboot(){await fetch('/api/reconnect',{method:'POST'});alert('Riavvio...');}
-load();
-</script></body></html>
-)rawhtml";
+// --- Fallback HTML (served if LittleFS/index.html missing) -------------------
+static const char FALLBACK_HTML[] PROGMEM =
+"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>Marble Clock</title>"
+"<style>"
+"*{box-sizing:border-box;margin:0;padding:0}"
+"body{font-family:sans-serif;background:#111;color:#eee;padding:20px}"
+"h1{color:#4fc3f7;margin-bottom:20px}h2{color:#aaa;margin:16px 0 8px}"
+"input,select{width:100%;padding:8px;margin:4px 0 12px;background:#222;border:1px solid #444;color:#eee;border-radius:6px}"
+"button{padding:10px 20px;background:#01696f;color:#fff;border:none;border-radius:6px;cursor:pointer;width:100%;margin:4px 0}"
+"button:hover{background:#0c4e54}"
+".row{display:flex;gap:8px}.row input{flex:1}"
+".status{background:#1a1a1a;border-radius:8px;padding:12px;margin-bottom:16px;font-size:14px}"
+".ok{color:#6daa45}.err{color:#dd6974}"
+"</style></head><body>"
+"<h1>Marble Clock</h1>"
+"<div class='status' id='st'>Loading...</div>"
+"<h2>WiFi</h2>"
+"<input id='ssid' placeholder='SSID'>"
+"<input id='pass' type='password' placeholder='Password'>"
+"<h2>LED</h2>"
+"<label>LED Type</label>"
+"<select id='ledModel'><option value='0'>WS2812B</option><option value='1'>SK6812 (RGBW)</option></select>"
+"<label>LED Count</label><input id='numLeds' type='number' min='1' max='200'>"
+"<label>Global Brightness (0-255)</label><input id='brightness' type='range' min='0' max='255'>"
+"<h2>Hour Hand Color</h2>"
+"<div class='row'><input id='hR' type='number' min='0' max='255' placeholder='R'>"
+"<input id='hG' type='number' min='0' max='255' placeholder='G'>"
+"<input id='hB' type='number' min='0' max='255' placeholder='B'></div>"
+"<label>Hour Brightness</label><input id='hBri' type='range' min='0' max='255'>"
+"<h2>Minute Hand Color</h2>"
+"<div class='row'><input id='mR' type='number' min='0' max='255' placeholder='R'>"
+"<input id='mG' type='number' min='0' max='255' placeholder='G'>"
+"<input id='mB' type='number' min='0' max='255' placeholder='B'></div>"
+"<label>Minute Brightness</label><input id='mBri' type='range' min='0' max='255'>"
+"<h2>Time</h2>"
+"<label>UTC Offset (seconds, e.g. 3600=CET)</label>"
+"<input id='utcOff' type='number'>"
+"<label>Manual hour (-1 = NTP)</label>"
+"<div class='row'><input id='manH' type='number' min='-1' max='23' placeholder='Hour'>"
+"<input id='manM' type='number' min='0' max='59' placeholder='Min'></div>"
+"<h2>LED Mapping</h2>"
+"<select id='mapMode'>"
+"<option value='0'>Spread evenly (recommended)</option>"
+"<option value='1'>First 60</option>"
+"<option value='2'>All with gap</option>"
+"</select><br><br>"
+"<button onclick='save()'>Save &amp; Apply</button>"
+"<button onclick='doSyncNTP()'>Sync NTP</button>"
+"<button onclick='reboot()'>Reboot</button>"
+"<script>"
+"async function load(){"
+"  try{"
+"    const r=await fetch('/api/status');const d=await r.json();"
+"    document.getElementById('st').innerHTML="
+"      `WiFi: <span class='${d.wifiConnected?'ok':'err'}'>${d.wifiConnected?d.ssid+' ('+d.ip+')':'not connected'}</span>`"
+"      +` | NTP: <span class='${d.ntpSynced?'ok':'err'}'>${d.ntpSynced?d.hour+':'+String(d.minute).padStart(2,'0'):'not synced'}</span>`;"
+"    document.getElementById('ssid').value=d.ssid||'';"
+"    document.getElementById('numLeds').value=d.numLeds;"
+"    document.getElementById('brightness').value=d.brightness;"
+"    document.getElementById('hR').value=d.hourR;"
+"    document.getElementById('hG').value=d.hourG;"
+"    document.getElementById('hB').value=d.hourB;"
+"    document.getElementById('mR').value=d.minR;"
+"    document.getElementById('mG').value=d.minG;"
+"    document.getElementById('mB').value=d.minB;"
+"    document.getElementById('hBri').value=d.hourBrightness;"
+"    document.getElementById('mBri').value=d.minBrightness;"
+"    document.getElementById('utcOff').value=d.utcOffsetSec;"
+"    document.getElementById('manH').value=d.manualHour;"
+"    document.getElementById('manM').value=d.manualMinute;"
+"    document.getElementById('mapMode').value=d.mappingMode;"
+"    document.getElementById('ledModel').value=d.ledModel||0;"
+"  }catch(e){document.getElementById('st').innerHTML=\"<span class='err'>Connection error</span>\";}"
+"}"
+"async function save(){"
+"  const body={"
+"    ssid:document.getElementById('ssid').value,"
+"    password:document.getElementById('pass').value,"
+"    numLeds:+document.getElementById('numLeds').value,"
+"    brightness:+document.getElementById('brightness').value,"
+"    hourR:+document.getElementById('hR').value,"
+"    hourG:+document.getElementById('hG').value,"
+"    hourB:+document.getElementById('hB').value,"
+"    minR:+document.getElementById('mR').value,"
+"    minG:+document.getElementById('mG').value,"
+"    minB:+document.getElementById('mB').value,"
+"    hourBrightness:+document.getElementById('hBri').value,"
+"    minBrightness:+document.getElementById('mBri').value,"
+"    utcOffsetSec:+document.getElementById('utcOff').value,"
+"    manualHour:+document.getElementById('manH').value,"
+"    manualMinute:+document.getElementById('manM').value,"
+"    mappingMode:+document.getElementById('mapMode').value,"
+"    ledModel:+document.getElementById('ledModel').value"
+"  };"
+"  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
+"  alert('Saved! Reboot to apply LED type change.');"
+"}"
+"async function doSyncNTP(){"
+"  await fetch('/api/syncntp',{method:'POST'});"
+"  alert('NTP sync started');"
+"}"
+"async function reboot(){"
+"  await fetch('/api/reconnect',{method:'POST'});"
+"  alert('Rebooting...');"
+"}"
+"load();"
+"</script></body></html>";
 
-// ─── Web server ───────────────────────────────────────────────────────────────
+// --- Web server --------------------------------------------------------------
 void setupWebServer() {
   if (littlefsOK) {
     server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
   }
 
+  // Root: use LittleFS if available, else inline fallback
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
     if (!littlefsOK || !LittleFS.exists("/index.html")) {
       req->send_P(200, "text/html", FALLBACK_HTML);
@@ -344,7 +360,8 @@ void setupWebServer() {
     doc["manualHour"]     = cfg.manualHour;
     doc["manualMinute"]   = cfg.manualMinute;
     doc["ledModel"]       = cfg.ledModel;
-    String json; serializeJson(doc, json);
+    String json;
+    serializeJson(doc, json);
     req->send(200, "application/json", json);
   });
 
@@ -355,7 +372,8 @@ void setupWebServer() {
     [](AsyncWebServerRequest *req, uint8_t *data, size_t len, size_t, size_t) {
       JsonDocument doc;
       if (deserializeJson(doc, data, len)) {
-        req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}"); return;
+        req->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        return;
       }
       if (doc["ssid"].is<const char*>())     strlcpy(cfg.ssid,     doc["ssid"],     sizeof(cfg.ssid));
       if (doc["password"].is<const char*>()) strlcpy(cfg.password, doc["password"], sizeof(cfg.password));
@@ -389,14 +407,15 @@ void setupWebServer() {
 
   server.on("/api/reconnect", HTTP_POST, [](AsyncWebServerRequest *req) {
     req->send(200, "application/json", "{\"ok\":true}");
-    delay(200); ESP.restart();
+    delay(200);
+    ESP.restart();
   });
 
   server.begin();
   DBG.println("Web server started.");
 }
 
-// ─── Setup ────────────────────────────────────────────────────────────────────
+// --- Setup -------------------------------------------------------------------
 void setup() {
   DBG.begin(115200);
   delay(500);
@@ -405,12 +424,11 @@ void setup() {
 
   loadConfig();
 
-  // FastLED: SK6812 e WS2812B usano entrambi buffer CRGB in FastLED 3.9+
-  // Il tipo SK6812 trasmette 4 byte per LED (GRBW) con W=0 automaticamente.
+  // FastLED: SK6812 uses CRGB buffer in FastLED 3.9+, W channel = 0 auto
   if (cfg.ledModel == 1) {
     FastLED.addLeds<SK6812, DATA_PIN, GRB>(leds, MAX_LEDS)
            .setCorrection(TypicalLEDStrip);
-    DBG.println("LED: SK6812 (W=0, RGB mode)");
+    DBG.println("LED: SK6812");
   } else {
     FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, MAX_LEDS)
            .setCorrection(TypicalLEDStrip);
@@ -426,7 +444,7 @@ void setup() {
   } else {
     DBG.println("LittleFS OK");
     if (!LittleFS.exists("/index.html")) {
-      DBG.println("index.html missing - using inline fallback");
+      DBG.println("index.html missing - inline fallback active");
     }
   }
 
@@ -438,7 +456,7 @@ void setup() {
 
   setupWebServer();
 
-  // Animazione avvio: sweep
+  // Startup sweep animation
   for (int i = 0; i < cfg.numLeds; i++) {
     fill_solid(leds, cfg.numLeds, CRGB::Black);
     leds[i] = CRGB(0, 50, 80);
@@ -451,17 +469,17 @@ void setup() {
   DBG.println("Setup done.");
 }
 
-// ─── Loop ─────────────────────────────────────────────────────────────────────
+// --- Loop --------------------------------------------------------------------
 void loop() {
   ArduinoOTA.handle();
 
-  // Resync NTP ogni ora
+  // Resync NTP every hour
   if (wifiConnected && cfg.ntpEnabled &&
       (millis() - lastNTPSync > 3600000UL || lastNTPSync == 0)) {
     syncNTP();
   }
 
-  // Aggiorna display ogni secondo
+  // Update display every second
   if (millis() - lastUpdate > 1000) {
     lastUpdate = millis();
     int h, m;
