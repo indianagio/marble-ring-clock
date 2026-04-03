@@ -13,6 +13,9 @@
  *  - DEFAULT_NUM_LEDS = 40 (anello di test)
  *  - ledReverse: inverte la direzione di scorrimento dell'anello
  *  - ledModel modificabile dalla webapp (richiede reboot per reinit FastLED)
+ *  - showSeconds: lancetta secondi on/off + colore/intensità configurabili
+ *    Utile per verificare la mappatura dei LED senza il disturbo del secondo
+ *    che si sovrappone a ore/minuti
  */
 
 #include <Arduino.h>
@@ -55,8 +58,11 @@ struct Config {
   int     brightness;
   uint8_t hourR, hourG, hourB;
   uint8_t minR,  minG,  minB;
+  uint8_t secR,  secG,  secB;   // colore lancetta secondi
   int     hourBrightness;
   int     minBrightness;
+  int     secBrightness;        // intensità lancetta secondi
+  bool    showSeconds;          // mostra/nascondi lancetta secondi
   int     utcOffsetSec;
   int     manualHour;
   int     manualMinute;
@@ -66,7 +72,7 @@ struct Config {
   int     ledModel;     // 0=WS2812B, 1=SK6812
   int     ledOffset;
   int     ledSkip;
-  bool    ledReverse;   // true = inverte la direzione (LED verso parete)
+  bool    ledReverse;
 } cfg;
 
 bool wifiConnected = false;
@@ -88,8 +94,13 @@ void loadConfig() {
   cfg.minR           = prefs.getUChar("mR",        0);
   cfg.minG           = prefs.getUChar("mG",        180);
   cfg.minB           = prefs.getUChar("mB",        255);
+  cfg.secR           = prefs.getUChar("sR",        200);
+  cfg.secG           = prefs.getUChar("sG",        0);
+  cfg.secB           = prefs.getUChar("sB",        0);
   cfg.hourBrightness = prefs.getInt("hBri",        200);
   cfg.minBrightness  = prefs.getInt("mBri",        255);
+  cfg.secBrightness  = prefs.getInt("sBri",        160);
+  cfg.showSeconds    = prefs.getBool("showSec",    false); // default off
   cfg.utcOffsetSec   = prefs.getInt("utcOff",      DEFAULT_UTC_OFFSET);
   cfg.manualHour     = prefs.getInt("manHour",     -1);
   cfg.manualMinute   = prefs.getInt("manMin",      0);
@@ -115,8 +126,13 @@ void saveConfig() {
   prefs.putUChar("mR",        cfg.minR);
   prefs.putUChar("mG",        cfg.minG);
   prefs.putUChar("mB",        cfg.minB);
+  prefs.putUChar("sR",        cfg.secR);
+  prefs.putUChar("sG",        cfg.secG);
+  prefs.putUChar("sB",        cfg.secB);
   prefs.putInt("hBri",        cfg.hourBrightness);
   prefs.putInt("mBri",        cfg.minBrightness);
+  prefs.putInt("sBri",        cfg.secBrightness);
+  prefs.putBool("showSec",    cfg.showSeconds);
   prefs.putInt("utcOff",      cfg.utcOffsetSec);
   prefs.putInt("manHour",     cfg.manualHour);
   prefs.putInt("manMin",      cfg.manualMinute);
@@ -131,13 +147,6 @@ void saveConfig() {
 }
 
 // --- LED mapping -------------------------------------------------------------
-// logicalToPhysical: mappa posizione logica (0-59) -> indice fisico nel buffer
-//
-// ledSkip   : LED fisici iniziali sempre spenti (es. LED onboard C3)
-// ledOffset : rotazione anello (quale LED = ore 12)
-// ledReverse: inverte la direzione di numerazione dei LED dell'anello
-//             utile quando la striscia e' montata "verso la parete" e i LED
-//             scorrono in senso antiorario anziche' orario
 int logicalToPhysical(int logical, int totalLeds, int mode, int offset, int skip, bool reverse) {
   if (totalLeds <= 0) return -1;
   int pos;
@@ -152,17 +161,40 @@ int logicalToPhysical(int logical, int totalLeds, int mode, int offset, int skip
       pos = (int)round((float)logical * totalLeds / 60.0f) % totalLeds;
       break;
   }
-  // Applica rotazione
   pos = (pos + offset) % totalLeds;
-  // Inversione: rispecchia rispetto al numero totale di LED dell'anello
   if (reverse) pos = (totalLeds - pos) % totalLeds;
   return skip + pos;
 }
 
+// Applica un colore a una posizione fisica con gestione blend se già occupata
+void setLed(int pos, CRGB color, bool blend128 = false) {
+  if (pos < cfg.ledSkip || pos >= cfg.ledSkip + cfg.numLeds) return;
+  if (blend128) {
+    leds[pos] = blend(leds[pos], color, 128);
+  } else {
+    leds[pos] = color;
+  }
+}
+
 // --- Clock rendering ---------------------------------------------------------
-void renderClock(int hour24, int minute) {
+// Ordine di disegno: secondi -> minuti -> ore
+// Le lancette più "importanti" vengono scritte per ultime e vincono
+void renderClock(int hour24, int minute, int second) {
   fill_solid(leds, cfg.ledSkip + cfg.numLeds, CRGB::Black);
 
+  // --- SECONDI (primo strato, più bassa priorità) ---
+  if (cfg.showSeconds) {
+    int secPos = logicalToPhysical(second % 60, cfg.numLeds, cfg.mappingMode,
+                                    cfg.ledOffset, cfg.ledSkip, cfg.ledReverse);
+    CRGB sc(
+      (cfg.secR * cfg.secBrightness) / 255,
+      (cfg.secG * cfg.secBrightness) / 255,
+      (cfg.secB * cfg.secBrightness) / 255
+    );
+    setLed(secPos, sc);
+  }
+
+  // --- MINUTI ---
   int minPos = logicalToPhysical(minute % 60, cfg.numLeds, cfg.mappingMode,
                                   cfg.ledOffset, cfg.ledSkip, cfg.ledReverse);
   CRGB mc(
@@ -170,9 +202,13 @@ void renderClock(int hour24, int minute) {
     (cfg.minG  * cfg.minBrightness)  / 255,
     (cfg.minB  * cfg.minBrightness)  / 255
   );
-  if (minPos >= cfg.ledSkip && minPos < cfg.ledSkip + cfg.numLeds)
-    leds[minPos] = mc;
+  // Se minuti coincide con secondi: blend
+  bool minOnSec = (cfg.showSeconds && minPos ==
+    logicalToPhysical(second % 60, cfg.numLeds, cfg.mappingMode,
+                      cfg.ledOffset, cfg.ledSkip, cfg.ledReverse));
+  setLed(minPos, mc, minOnSec);
 
+  // --- ORE ---
   float hourFrac    = (hour24 % 12) * 5.0f + (minute / 12.0f);
   int   hourLogical = (int)round(hourFrac) % 60;
   int   hourPos     = logicalToPhysical(hourLogical, cfg.numLeds, cfg.mappingMode,
@@ -182,17 +218,14 @@ void renderClock(int hour24, int minute) {
     (cfg.hourG * cfg.hourBrightness) / 255,
     (cfg.hourB * cfg.hourBrightness) / 255
   );
-  if (hourPos >= cfg.ledSkip && hourPos < cfg.ledSkip + cfg.numLeds) {
-    leds[hourPos] = (hourPos == minPos) ? blend(hc, mc, 128) : hc;
-  }
+  // Se ore coincide con minuti o secondi: blend
+  bool hourOnOther = (hourPos == minPos);
+  setLed(hourPos, hc, hourOnOther);
 
   FastLED.show();
 }
 
 // --- FastLED init ------------------------------------------------------------
-// Chiamata all'avvio e ogni volta che ledModel cambia dalla webapp.
-// FastLED non supporta il cambio dinamico del tipo di LED senza reboot,
-// quindi salviamo e facciamo restart.
 void initFastLED() {
   if (cfg.ledModel == 1) {
     FastLED.addLeds<SK6812, DATA_PIN, GRB>(leds, MAX_LEDS).setCorrection(TypicalLEDStrip);
@@ -264,36 +297,41 @@ static const char FALLBACK_HTML[] PROGMEM =
 "<h1>Marble Clock</h1><div class='status' id='st'>Loading...</div>"
 "<h2>WiFi</h2><input id='ssid' placeholder='SSID'><input id='pass' type='password' placeholder='Password'>"
 "<h2>LED</h2>"
-"<label>Tipo LED</label><select id='ledModel'><option value='0'>WS2812B (default)</option><option value='1'>SK6812</option></select>"
-"<small style='color:#aaa'>Il cambio tipo LED richiede riavvio</small><br><br>"
-"<label>Numero LED anello</label><input id='numLeds' type='number' min='1' max='200'>"
-"<label>LED da saltare (ledSkip)</label><input id='ledSkip' type='number' min='0' max='10'>"
+"<label>Tipo LED</label><select id='ledModel'><option value='0'>WS2812B</option><option value='1'>SK6812</option></select>"
+"<label>Numero LED</label><input id='numLeds' type='number' min='1' max='200'>"
+"<label>LED skip</label><input id='ledSkip' type='number' min='0' max='10'>"
 "<label>Offset rotazione</label><input id='ledOffset' type='number' min='0' max='199'>"
-"<div class='chk'><input type='checkbox' id='ledReverse'><label>Inverti direzione (LED verso parete)</label></div>"
+"<div class='chk'><input type='checkbox' id='ledReverse'><label>Inverti direzione</label></div>"
 "<label>Luminosita globale</label><input id='brightness' type='range' min='0' max='255'>"
-"<h2>Colori ORE (R G B)</h2>"
+"<h2>Colori ORE</h2>"
 "<div class='row'><input id='hR' type='number' min='0' max='255' placeholder='R'>"
 "<input id='hG' type='number' min='0' max='255' placeholder='G'>"
 "<input id='hB' type='number' min='0' max='255' placeholder='B'></div>"
 "<label>Intensita ore</label><input id='hBri' type='range' min='0' max='255'>"
-"<h2>Colori MINUTI (R G B)</h2>"
+"<h2>Colori MINUTI</h2>"
 "<div class='row'><input id='mR' type='number' min='0' max='255' placeholder='R'>"
 "<input id='mG' type='number' min='0' max='255' placeholder='G'>"
 "<input id='mB' type='number' min='0' max='255' placeholder='B'></div>"
 "<label>Intensita minuti</label><input id='mBri' type='range' min='0' max='255'>"
+"<h2>Secondi</h2>"
+"<div class='chk'><input type='checkbox' id='showSeconds'><label>Mostra lancetta secondi</label></div>"
+"<div class='row'><input id='sR' type='number' min='0' max='255' placeholder='R'>"
+"<input id='sG' type='number' min='0' max='255' placeholder='G'>"
+"<input id='sB' type='number' min='0' max='255' placeholder='B'></div>"
+"<label>Intensita secondi</label><input id='sBri' type='range' min='0' max='255'>"
 "<h2>Orario</h2>"
-"<label>UTC Offset secondi (3600=CET, 7200=CEST)</label><input id='utcOff' type='number'>"
+"<label>UTC Offset (3600=CET, 7200=CEST)</label><input id='utcOff' type='number'>"
 "<label>Ora manuale (-1=NTP)</label>"
 "<div class='row'><input id='manH' type='number' min='-1' max='23'><input id='manM' type='number' min='0' max='59'></div>"
 "<h2>Mapping</h2><select id='mapMode'>"
 "<option value='0'>Distribuiti uniformemente</option>"
 "<option value='1'>Primi 60</option><option value='2'>Tutti con gap</option></select><br><br>"
 "<button onclick='save()'>Salva e applica</button>"
-"<button onclick='doSyncNTP()'>Sync NTP ora</button>"
+"<button onclick='doSyncNTP()'>Sync NTP</button>"
 "<button onclick='reboot()'>Riavvia</button>"
 "<script>"
 "async function load(){try{const r=await fetch('/api/status');const d=await r.json();"
-"document.getElementById('st').innerHTML=`WiFi: <span class='${d.wifiConnected?'ok':'err'}'>${d.wifiConnected?d.ssid+' ('+d.ip+')':'offline'}</span>`"
+"document.getElementById('st').innerHTML=`WiFi: <span class='${d.wifiConnected?'ok':'err'}'>${d.wifiConnected?d.ip:'offline'}</span>`"
 "+` | NTP: <span class='${d.ntpSynced?'ok':'err'}'>${d.ntpSynced?d.hour+':'+String(d.minute).padStart(2,'0'):'no sync'}</span>`;"
 "document.getElementById('ssid').value=d.ssid||'';"
 "document.getElementById('numLeds').value=d.numLeds;"
@@ -303,12 +341,15 @@ static const char FALLBACK_HTML[] PROGMEM =
 "document.getElementById('brightness').value=d.brightness;"
 "document.getElementById('hR').value=d.hourR;document.getElementById('hG').value=d.hourG;document.getElementById('hB').value=d.hourB;"
 "document.getElementById('mR').value=d.minR;document.getElementById('mG').value=d.minG;document.getElementById('mB').value=d.minB;"
+"document.getElementById('sR').value=d.secR||200;document.getElementById('sG').value=d.secG||0;document.getElementById('sB').value=d.secB||0;"
 "document.getElementById('hBri').value=d.hourBrightness;document.getElementById('mBri').value=d.minBrightness;"
+"document.getElementById('sBri').value=d.secBrightness||160;"
+"document.getElementById('showSeconds').checked=d.showSeconds||false;"
 "document.getElementById('utcOff').value=d.utcOffsetSec;"
 "document.getElementById('manH').value=d.manualHour;document.getElementById('manM').value=d.manualMinute;"
 "document.getElementById('mapMode').value=d.mappingMode;"
 "document.getElementById('ledModel').value=d.ledModel||0;"
-"}catch(e){document.getElementById('st').innerHTML=\"<span class='err'>Errore connessione</span>\";}"
+"}catch(e){document.getElementById('st').innerHTML=\"<span class='err'>Errore</span>\";}"
 "}"
 "async function save(){"
 "const prevModel=parseInt(document.getElementById('ledModel').dataset.loaded||0);"
@@ -320,7 +361,10 @@ static const char FALLBACK_HTML[] PROGMEM =
 "brightness:+document.getElementById('brightness').value,"
 "hourR:+document.getElementById('hR').value,hourG:+document.getElementById('hG').value,hourB:+document.getElementById('hB').value,"
 "minR:+document.getElementById('mR').value,minG:+document.getElementById('mG').value,minB:+document.getElementById('mB').value,"
+"secR:+document.getElementById('sR').value,secG:+document.getElementById('sG').value,secB:+document.getElementById('sB').value,"
 "hourBrightness:+document.getElementById('hBri').value,minBrightness:+document.getElementById('mBri').value,"
+"secBrightness:+document.getElementById('sBri').value,"
+"showSeconds:document.getElementById('showSeconds').checked,"
 "utcOffsetSec:+document.getElementById('utcOff').value,"
 "manualHour:+document.getElementById('manH').value,manualMinute:+document.getElementById('manM').value,"
 "mappingMode:+document.getElementById('mapMode').value,ledModel:newModel};"
@@ -328,7 +372,7 @@ static const char FALLBACK_HTML[] PROGMEM =
 "if(newModel!==prevModel){alert('Tipo LED cambiato. Riavvio necessario.');await fetch('/api/reconnect',{method:'POST'});}"
 "else{alert('Salvato!');load();}}"
 "async function doSyncNTP(){await fetch('/api/syncntp',{method:'POST'});alert('Sync NTP avviato');setTimeout(load,2500);}"
-"async function reboot(){await fetch('/api/reconnect',{method:'POST'});alert('Riavvio in corso...');}"
+"async function reboot(){await fetch('/api/reconnect',{method:'POST'});alert('Riavvio...');}"
 "load().then(()=>{const m=document.getElementById('ledModel');m.dataset.loaded=m.value;});"
 "</script></body></html>";
 
@@ -369,8 +413,13 @@ void setupWebServer() {
     doc["minR"]           = cfg.minR;
     doc["minG"]           = cfg.minG;
     doc["minB"]           = cfg.minB;
+    doc["secR"]           = cfg.secR;
+    doc["secG"]           = cfg.secG;
+    doc["secB"]           = cfg.secB;
     doc["hourBrightness"] = cfg.hourBrightness;
     doc["minBrightness"]  = cfg.minBrightness;
+    doc["secBrightness"]  = cfg.secBrightness;
+    doc["showSeconds"]    = cfg.showSeconds;
     doc["utcOffsetSec"]   = cfg.utcOffsetSec;
     doc["ntpEnabled"]     = cfg.ntpEnabled;
     doc["ledDensity"]     = cfg.ledDensity;
@@ -407,8 +456,13 @@ void setupWebServer() {
       if (doc["minR"].is<int>())             cfg.minR           = constrain((int)doc["minR"], 0, 255);
       if (doc["minG"].is<int>())             cfg.minG           = constrain((int)doc["minG"], 0, 255);
       if (doc["minB"].is<int>())             cfg.minB           = constrain((int)doc["minB"], 0, 255);
+      if (doc["secR"].is<int>())             cfg.secR           = constrain((int)doc["secR"], 0, 255);
+      if (doc["secG"].is<int>())             cfg.secG           = constrain((int)doc["secG"], 0, 255);
+      if (doc["secB"].is<int>())             cfg.secB           = constrain((int)doc["secB"], 0, 255);
       if (doc["hourBrightness"].is<int>())   cfg.hourBrightness = constrain((int)doc["hourBrightness"], 0, 255);
       if (doc["minBrightness"].is<int>())    cfg.minBrightness  = constrain((int)doc["minBrightness"], 0, 255);
+      if (doc["secBrightness"].is<int>())    cfg.secBrightness  = constrain((int)doc["secBrightness"], 0, 255);
+      if (doc["showSeconds"].is<bool>())     cfg.showSeconds    = (bool)doc["showSeconds"];
       if (doc["utcOffsetSec"].is<int>()) {
         int newOff = (int)doc["utcOffsetSec"];
         if (newOff != cfg.utcOffsetSec) { cfg.utcOffsetSec = newOff; utcChanged = true; }
@@ -428,7 +482,6 @@ void setupWebServer() {
       FastLED.setBrightness(cfg.brightness);
       saveConfig();
       if (utcChanged && wifiConnected && cfg.ntpEnabled) syncNTP();
-      // Se il modello LED e' cambiato, la webapp fara' un /api/reconnect separato
       req->send(200, "application/json", modelChanged ?
         "{\"ok\":true,\"rebootRequired\":true}" :
         "{\"ok\":true,\"rebootRequired\":false}"
@@ -464,8 +517,8 @@ void setup() {
   fill_solid(leds, MAX_LEDS, CRGB::Black);
   FastLED.show();
 
-  DBG.printf("Config: %d LED, skip %d, offset %d, reverse %d, model %d\n",
-    cfg.numLeds, cfg.ledSkip, cfg.ledOffset, cfg.ledReverse, cfg.ledModel);
+  DBG.printf("Config: %d LED, skip %d, offset %d, reverse %d, model %d, showSec %d\n",
+    cfg.numLeds, cfg.ledSkip, cfg.ledOffset, cfg.ledReverse, cfg.ledModel, cfg.showSeconds);
 
   littlefsOK = LittleFS.begin(true);
   DBG.println(littlefsOK ? "LittleFS OK" : "LittleFS FAILED - fallback attivo");
@@ -480,7 +533,7 @@ void setup() {
 
   setupWebServer();
 
-  // Startup sweep sui soli LED dell'anello
+  // Startup sweep
   for (int i = 0; i < cfg.numLeds; i++) {
     fill_solid(leds, MAX_LEDS, CRGB::Black);
     leds[cfg.ledSkip + i] = CRGB(0, 50, 80);
@@ -504,15 +557,17 @@ void loop() {
 
   if (millis() - lastUpdate > 1000) {
     lastUpdate = millis();
-    int h, m;
+    int h, m, s;
     if (cfg.manualHour >= 0) {
       h = cfg.manualHour;
       m = cfg.manualMinute;
+      s = 0;
     } else {
       timeClient.update();
       h = timeClient.getHours();
       m = timeClient.getMinutes();
+      s = timeClient.getSeconds();
     }
-    renderClock(h, m);
+    renderClock(h, m, s);
   }
 }
