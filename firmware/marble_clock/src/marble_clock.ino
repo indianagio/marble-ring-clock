@@ -11,6 +11,8 @@
  *  - ledSkip: salta N LED all'inizio della striscia (es. LED onboard ESP32-C3)
  *  - DATA_PIN default = 8 (WS2812 onboard ESP32-C3 Mini)
  *  - DEFAULT_NUM_LEDS = 40 (anello di test)
+ *  - ledReverse: inverte la direzione di scorrimento dell'anello
+ *  - ledModel modificabile dalla webapp (richiede reboot per reinit FastLED)
  */
 
 #include <Arduino.h>
@@ -26,8 +28,6 @@
 
 #define DBG Serial0
 
-// DATA_PIN: usa pin 8 per ESP32-C3 Mini (WS2812 onboard + striscia esterna)
-// Override con -D DATA_PIN_OVERRIDE=X in platformio.ini se usi altro pin
 #ifndef DATA_PIN_OVERRIDE
   #define DATA_PIN 8
 #else
@@ -35,9 +35,9 @@
 #endif
 
 #define MAX_LEDS           200
-#define DEFAULT_NUM_LEDS    40   // anello di test con 40 LED
+#define DEFAULT_NUM_LEDS    40
 #define DEFAULT_BRIGHTNESS  80
-#define DEFAULT_LED_SKIP     1   // salta il LED 0 (onboard ESP32-C3)
+#define DEFAULT_LED_SKIP     1
 #define NTP_SERVER         "pool.ntp.org"
 #define DEFAULT_UTC_OFFSET  3600
 
@@ -51,7 +51,7 @@ NTPClient      timeClient(ntpUDP, NTP_SERVER);
 struct Config {
   char    ssid[64];
   char    password[64];
-  int     numLeds;        // LED dell'anello (non conteggia quelli skippati)
+  int     numLeds;
   int     brightness;
   uint8_t hourR, hourG, hourB;
   uint8_t minR,  minG,  minB;
@@ -62,10 +62,11 @@ struct Config {
   int     manualMinute;
   bool    ntpEnabled;
   int     ledDensity;
-  int     mappingMode;  // 0=spread (consigliato), 1=first60, 2=all-with-gap
+  int     mappingMode;  // 0=spread, 1=first60, 2=all-with-gap
   int     ledModel;     // 0=WS2812B, 1=SK6812
-  int     ledOffset;    // rotazione: quale LED fisico corrisponde a ore 12
-  int     ledSkip;      // quanti LED saltare all'inizio (es. 1 per LED onboard C3)
+  int     ledOffset;
+  int     ledSkip;
+  bool    ledReverse;   // true = inverte la direzione (LED verso parete)
 } cfg;
 
 bool wifiConnected = false;
@@ -79,89 +80,91 @@ void loadConfig() {
   prefs.begin("clock", true);
   strlcpy(cfg.ssid,     prefs.getString("ssid", "").c_str(), sizeof(cfg.ssid));
   strlcpy(cfg.password, prefs.getString("pass", "").c_str(), sizeof(cfg.password));
-  cfg.numLeds        = prefs.getInt("numLeds",  DEFAULT_NUM_LEDS);
-  cfg.brightness     = prefs.getInt("bri",      DEFAULT_BRIGHTNESS);
-  cfg.hourR          = prefs.getUChar("hR",      255);
-  cfg.hourG          = prefs.getUChar("hG",      80);
-  cfg.hourB          = prefs.getUChar("hB",      0);
-  cfg.minR           = prefs.getUChar("mR",      0);
-  cfg.minG           = prefs.getUChar("mG",      180);
-  cfg.minB           = prefs.getUChar("mB",      255);
-  cfg.hourBrightness = prefs.getInt("hBri",      200);
-  cfg.minBrightness  = prefs.getInt("mBri",      255);
-  cfg.utcOffsetSec   = prefs.getInt("utcOff",    DEFAULT_UTC_OFFSET);
-  cfg.manualHour     = prefs.getInt("manHour",   -1);
-  cfg.manualMinute   = prefs.getInt("manMin",    0);
-  cfg.ntpEnabled     = prefs.getBool("ntpEn",    true);
-  cfg.ledDensity     = prefs.getInt("density",   60);
-  cfg.mappingMode    = prefs.getInt("mapMode",   0);
-  cfg.ledModel       = prefs.getInt("ledModel",  0);
-  cfg.ledOffset      = prefs.getInt("ledOffset", 0);
-  cfg.ledSkip        = prefs.getInt("ledSkip",   DEFAULT_LED_SKIP);
+  cfg.numLeds        = prefs.getInt("numLeds",   DEFAULT_NUM_LEDS);
+  cfg.brightness     = prefs.getInt("bri",        DEFAULT_BRIGHTNESS);
+  cfg.hourR          = prefs.getUChar("hR",        255);
+  cfg.hourG          = prefs.getUChar("hG",        80);
+  cfg.hourB          = prefs.getUChar("hB",        0);
+  cfg.minR           = prefs.getUChar("mR",        0);
+  cfg.minG           = prefs.getUChar("mG",        180);
+  cfg.minB           = prefs.getUChar("mB",        255);
+  cfg.hourBrightness = prefs.getInt("hBri",        200);
+  cfg.minBrightness  = prefs.getInt("mBri",        255);
+  cfg.utcOffsetSec   = prefs.getInt("utcOff",      DEFAULT_UTC_OFFSET);
+  cfg.manualHour     = prefs.getInt("manHour",     -1);
+  cfg.manualMinute   = prefs.getInt("manMin",      0);
+  cfg.ntpEnabled     = prefs.getBool("ntpEn",      true);
+  cfg.ledDensity     = prefs.getInt("density",     60);
+  cfg.mappingMode    = prefs.getInt("mapMode",     0);
+  cfg.ledModel       = prefs.getInt("ledModel",    0);
+  cfg.ledOffset      = prefs.getInt("ledOffset",   0);
+  cfg.ledSkip        = prefs.getInt("ledSkip",     DEFAULT_LED_SKIP);
+  cfg.ledReverse     = prefs.getBool("ledReverse", false);
   prefs.end();
 }
 
 void saveConfig() {
   prefs.begin("clock", false);
-  prefs.putString("ssid",  cfg.ssid);
-  prefs.putString("pass",  cfg.password);
-  prefs.putInt("numLeds",  cfg.numLeds);
-  prefs.putInt("bri",      cfg.brightness);
-  prefs.putUChar("hR",     cfg.hourR);
-  prefs.putUChar("hG",     cfg.hourG);
-  prefs.putUChar("hB",     cfg.hourB);
-  prefs.putUChar("mR",     cfg.minR);
-  prefs.putUChar("mG",     cfg.minG);
-  prefs.putUChar("mB",     cfg.minB);
-  prefs.putInt("hBri",     cfg.hourBrightness);
-  prefs.putInt("mBri",     cfg.minBrightness);
-  prefs.putInt("utcOff",   cfg.utcOffsetSec);
-  prefs.putInt("manHour",  cfg.manualHour);
-  prefs.putInt("manMin",   cfg.manualMinute);
-  prefs.putBool("ntpEn",   cfg.ntpEnabled);
-  prefs.putInt("density",  cfg.ledDensity);
-  prefs.putInt("mapMode",  cfg.mappingMode);
-  prefs.putInt("ledModel", cfg.ledModel);
-  prefs.putInt("ledOffset",cfg.ledOffset);
-  prefs.putInt("ledSkip",  cfg.ledSkip);
+  prefs.putString("ssid",     cfg.ssid);
+  prefs.putString("pass",     cfg.password);
+  prefs.putInt("numLeds",     cfg.numLeds);
+  prefs.putInt("bri",         cfg.brightness);
+  prefs.putUChar("hR",        cfg.hourR);
+  prefs.putUChar("hG",        cfg.hourG);
+  prefs.putUChar("hB",        cfg.hourB);
+  prefs.putUChar("mR",        cfg.minR);
+  prefs.putUChar("mG",        cfg.minG);
+  prefs.putUChar("mB",        cfg.minB);
+  prefs.putInt("hBri",        cfg.hourBrightness);
+  prefs.putInt("mBri",        cfg.minBrightness);
+  prefs.putInt("utcOff",      cfg.utcOffsetSec);
+  prefs.putInt("manHour",     cfg.manualHour);
+  prefs.putInt("manMin",      cfg.manualMinute);
+  prefs.putBool("ntpEn",      cfg.ntpEnabled);
+  prefs.putInt("density",     cfg.ledDensity);
+  prefs.putInt("mapMode",     cfg.mappingMode);
+  prefs.putInt("ledModel",    cfg.ledModel);
+  prefs.putInt("ledOffset",   cfg.ledOffset);
+  prefs.putInt("ledSkip",     cfg.ledSkip);
+  prefs.putBool("ledReverse", cfg.ledReverse);
   prefs.end();
 }
 
 // --- LED mapping -------------------------------------------------------------
-// logicalToPhysical: mappa posizione logica (0-59) -> indice fisico LED
-// Tiene conto di:
-//   ledSkip  : offset iniziale fisso (LED saltati, es. LED onboard)
-//   ledOffset: rotazione dell'anello (quale LED fisico = ore 12)
-//   mappingMode: come distribuire 60 posizioni logiche su numLeds fisici
+// logicalToPhysical: mappa posizione logica (0-59) -> indice fisico nel buffer
 //
-// Il buffer FastLED ha dimensione MAX_LEDS;
-// i LED [0..ledSkip-1] vengono sempre tenuti a nero in renderClock.
-int logicalToPhysical(int logical, int totalLeds, int mode, int offset, int skip) {
+// ledSkip   : LED fisici iniziali sempre spenti (es. LED onboard C3)
+// ledOffset : rotazione anello (quale LED = ore 12)
+// ledReverse: inverte la direzione di numerazione dei LED dell'anello
+//             utile quando la striscia e' montata "verso la parete" e i LED
+//             scorrono in senso antiorario anziche' orario
+int logicalToPhysical(int logical, int totalLeds, int mode, int offset, int skip, bool reverse) {
   if (totalLeds <= 0) return -1;
   int pos;
   switch (mode) {
     case 1:
-      // Usa direttamente i primi 60 indici dell'anello
       pos = logical;
       if (pos >= totalLeds) return -1;
       break;
     case 0:
     case 2:
     default:
-      // Distribuisce le 60 posizioni logiche uniformemente sui totalLeds LED
       pos = (int)round((float)logical * totalLeds / 60.0f) % totalLeds;
       break;
   }
-  // Applica rotazione anello, poi aggiunge lo skip iniziale
-  return skip + (pos + offset) % totalLeds;
+  // Applica rotazione
+  pos = (pos + offset) % totalLeds;
+  // Inversione: rispecchia rispetto al numero totale di LED dell'anello
+  if (reverse) pos = (totalLeds - pos) % totalLeds;
+  return skip + pos;
 }
 
 // --- Clock rendering ---------------------------------------------------------
 void renderClock(int hour24, int minute) {
-  // Spegni tutto il buffer (include LED skippati)
   fill_solid(leds, cfg.ledSkip + cfg.numLeds, CRGB::Black);
 
-  int minPos = logicalToPhysical(minute % 60, cfg.numLeds, cfg.mappingMode, cfg.ledOffset, cfg.ledSkip);
+  int minPos = logicalToPhysical(minute % 60, cfg.numLeds, cfg.mappingMode,
+                                  cfg.ledOffset, cfg.ledSkip, cfg.ledReverse);
   CRGB mc(
     (cfg.minR  * cfg.minBrightness)  / 255,
     (cfg.minG  * cfg.minBrightness)  / 255,
@@ -172,7 +175,8 @@ void renderClock(int hour24, int minute) {
 
   float hourFrac    = (hour24 % 12) * 5.0f + (minute / 12.0f);
   int   hourLogical = (int)round(hourFrac) % 60;
-  int   hourPos     = logicalToPhysical(hourLogical, cfg.numLeds, cfg.mappingMode, cfg.ledOffset, cfg.ledSkip);
+  int   hourPos     = logicalToPhysical(hourLogical, cfg.numLeds, cfg.mappingMode,
+                                         cfg.ledOffset, cfg.ledSkip, cfg.ledReverse);
   CRGB hc(
     (cfg.hourR * cfg.hourBrightness) / 255,
     (cfg.hourG * cfg.hourBrightness) / 255,
@@ -183,6 +187,21 @@ void renderClock(int hour24, int minute) {
   }
 
   FastLED.show();
+}
+
+// --- FastLED init ------------------------------------------------------------
+// Chiamata all'avvio e ogni volta che ledModel cambia dalla webapp.
+// FastLED non supporta il cambio dinamico del tipo di LED senza reboot,
+// quindi salviamo e facciamo restart.
+void initFastLED() {
+  if (cfg.ledModel == 1) {
+    FastLED.addLeds<SK6812, DATA_PIN, GRB>(leds, MAX_LEDS).setCorrection(TypicalLEDStrip);
+    DBG.println("LED: SK6812");
+  } else {
+    FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, MAX_LEDS).setCorrection(TypicalLEDStrip);
+    DBG.println("LED: WS2812B");
+  }
+  FastLED.setBrightness(cfg.brightness);
 }
 
 // --- WiFi --------------------------------------------------------------------
@@ -240,14 +259,17 @@ static const char FALLBACK_HTML[] PROGMEM =
 "button{padding:10px 20px;background:#01696f;color:#fff;border:none;border-radius:6px;cursor:pointer;width:100%;margin:4px 0}"
 ".row{display:flex;gap:8px}.row input{flex:1}"
 ".status{background:#1a1a1a;border-radius:8px;padding:12px;margin-bottom:16px;font-size:14px}"
-".ok{color:#6daa45}.err{color:#dd6974}</style></head><body>"
+".ok{color:#6daa45}.err{color:#dd6974}"
+".chk{display:flex;align-items:center;gap:8px;margin:8px 0}</style></head><body>"
 "<h1>Marble Clock</h1><div class='status' id='st'>Loading...</div>"
 "<h2>WiFi</h2><input id='ssid' placeholder='SSID'><input id='pass' type='password' placeholder='Password'>"
 "<h2>LED</h2>"
-"<label>Tipo LED</label><select id='ledModel'><option value='0'>WS2812B</option><option value='1'>SK6812</option></select>"
+"<label>Tipo LED</label><select id='ledModel'><option value='0'>WS2812B (default)</option><option value='1'>SK6812</option></select>"
+"<small style='color:#aaa'>Il cambio tipo LED richiede riavvio</small><br><br>"
 "<label>Numero LED anello</label><input id='numLeds' type='number' min='1' max='200'>"
-"<label>LED da saltare all'inizio (ledSkip, es. 1 per LED onboard C3)</label><input id='ledSkip' type='number' min='0' max='10'>"
-"<label>Offset rotazione (0 = primo LED dell'anello a ore 12)</label><input id='ledOffset' type='number' min='0' max='199'>"
+"<label>LED da saltare (ledSkip)</label><input id='ledSkip' type='number' min='0' max='10'>"
+"<label>Offset rotazione</label><input id='ledOffset' type='number' min='0' max='199'>"
+"<div class='chk'><input type='checkbox' id='ledReverse'><label>Inverti direzione (LED verso parete)</label></div>"
 "<label>Luminosita globale</label><input id='brightness' type='range' min='0' max='255'>"
 "<h2>Colori ORE (R G B)</h2>"
 "<div class='row'><input id='hR' type='number' min='0' max='255' placeholder='R'>"
@@ -277,6 +299,7 @@ static const char FALLBACK_HTML[] PROGMEM =
 "document.getElementById('numLeds').value=d.numLeds;"
 "document.getElementById('ledSkip').value=d.ledSkip!=null?d.ledSkip:1;"
 "document.getElementById('ledOffset').value=d.ledOffset||0;"
+"document.getElementById('ledReverse').checked=d.ledReverse||false;"
 "document.getElementById('brightness').value=d.brightness;"
 "document.getElementById('hR').value=d.hourR;document.getElementById('hG').value=d.hourG;document.getElementById('hB').value=d.hourB;"
 "document.getElementById('mR').value=d.minR;document.getElementById('mG').value=d.minG;document.getElementById('mB').value=d.minB;"
@@ -287,19 +310,27 @@ static const char FALLBACK_HTML[] PROGMEM =
 "document.getElementById('ledModel').value=d.ledModel||0;"
 "}catch(e){document.getElementById('st').innerHTML=\"<span class='err'>Errore connessione</span>\";}"
 "}"
-"async function save(){const body={ssid:document.getElementById('ssid').value,password:document.getElementById('pass').value,"
+"async function save(){"
+"const prevModel=parseInt(document.getElementById('ledModel').dataset.loaded||0);"
+"const newModel=parseInt(document.getElementById('ledModel').value);"
+"const body={ssid:document.getElementById('ssid').value,password:document.getElementById('pass').value,"
 "numLeds:+document.getElementById('numLeds').value,ledSkip:+document.getElementById('ledSkip').value,"
-"ledOffset:+document.getElementById('ledOffset').value,brightness:+document.getElementById('brightness').value,"
+"ledOffset:+document.getElementById('ledOffset').value,"
+"ledReverse:document.getElementById('ledReverse').checked,"
+"brightness:+document.getElementById('brightness').value,"
 "hourR:+document.getElementById('hR').value,hourG:+document.getElementById('hG').value,hourB:+document.getElementById('hB').value,"
 "minR:+document.getElementById('mR').value,minG:+document.getElementById('mG').value,minB:+document.getElementById('mB').value,"
 "hourBrightness:+document.getElementById('hBri').value,minBrightness:+document.getElementById('mBri').value,"
 "utcOffsetSec:+document.getElementById('utcOff').value,"
 "manualHour:+document.getElementById('manH').value,manualMinute:+document.getElementById('manM').value,"
-"mappingMode:+document.getElementById('mapMode').value,ledModel:+document.getElementById('ledModel').value};"
-"await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});alert('Salvato!');load();}"
+"mappingMode:+document.getElementById('mapMode').value,ledModel:newModel};"
+"await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
+"if(newModel!==prevModel){alert('Tipo LED cambiato. Riavvio necessario.');await fetch('/api/reconnect',{method:'POST'});}"
+"else{alert('Salvato!');load();}}"
 "async function doSyncNTP(){await fetch('/api/syncntp',{method:'POST'});alert('Sync NTP avviato');setTimeout(load,2500);}"
 "async function reboot(){await fetch('/api/reconnect',{method:'POST'});alert('Riavvio in corso...');}"
-"load();</script></body></html>";
+"load().then(()=>{const m=document.getElementById('ledModel');m.dataset.loaded=m.value;});"
+"</script></body></html>";
 
 // --- Web server --------------------------------------------------------------
 void setupWebServer() {
@@ -317,7 +348,6 @@ void setupWebServer() {
 
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *req) {
     JsonDocument doc;
-    // Ora corrente: manuale se impostata, altrimenti NTP
     if (cfg.manualHour >= 0) {
       doc["hour"]   = cfg.manualHour;
       doc["minute"] = cfg.manualMinute;
@@ -350,6 +380,7 @@ void setupWebServer() {
     doc["ledModel"]       = cfg.ledModel;
     doc["ledOffset"]      = cfg.ledOffset;
     doc["ledSkip"]        = cfg.ledSkip;
+    doc["ledReverse"]     = cfg.ledReverse;
     String json;
     serializeJson(doc, json);
     req->send(200, "application/json", json);
@@ -364,7 +395,8 @@ void setupWebServer() {
         req->send(400, "application/json", "{\"error\":\"JSON non valido\"}");
         return;
       }
-      bool utcChanged = false;
+      bool utcChanged   = false;
+      bool modelChanged = false;
       if (doc["ssid"].is<const char*>())     strlcpy(cfg.ssid,     doc["ssid"],     sizeof(cfg.ssid));
       if (doc["password"].is<const char*>()) strlcpy(cfg.password, doc["password"], sizeof(cfg.password));
       if (doc["numLeds"].is<int>())          cfg.numLeds        = constrain((int)doc["numLeds"], 1, MAX_LEDS);
@@ -381,20 +413,26 @@ void setupWebServer() {
         int newOff = (int)doc["utcOffsetSec"];
         if (newOff != cfg.utcOffsetSec) { cfg.utcOffsetSec = newOff; utcChanged = true; }
       }
-      if (doc["ntpEnabled"].is<bool>())      cfg.ntpEnabled     = (bool)doc["ntpEnabled"];
-      if (doc["ledDensity"].is<int>())       cfg.ledDensity     = (int)doc["ledDensity"];
-      if (doc["mappingMode"].is<int>())      cfg.mappingMode    = constrain((int)doc["mappingMode"], 0, 2);
-      if (doc["manualHour"].is<int>())       cfg.manualHour     = constrain((int)doc["manualHour"], -1, 23);
-      if (doc["manualMinute"].is<int>())     cfg.manualMinute   = constrain((int)doc["manualMinute"], 0, 59);
-      if (doc["ledModel"].is<int>())         cfg.ledModel       = constrain((int)doc["ledModel"], 0, 1);
-      if (doc["ledOffset"].is<int>())        cfg.ledOffset      = constrain((int)doc["ledOffset"], 0, MAX_LEDS - 1);
-      if (doc["ledSkip"].is<int>())          cfg.ledSkip        = constrain((int)doc["ledSkip"], 0, 10);
+      if (doc["ntpEnabled"].is<bool>())     cfg.ntpEnabled  = (bool)doc["ntpEnabled"];
+      if (doc["ledDensity"].is<int>())      cfg.ledDensity  = (int)doc["ledDensity"];
+      if (doc["mappingMode"].is<int>())     cfg.mappingMode = constrain((int)doc["mappingMode"], 0, 2);
+      if (doc["manualHour"].is<int>())      cfg.manualHour  = constrain((int)doc["manualHour"], -1, 23);
+      if (doc["manualMinute"].is<int>())    cfg.manualMinute= constrain((int)doc["manualMinute"], 0, 59);
+      if (doc["ledOffset"].is<int>())       cfg.ledOffset   = constrain((int)doc["ledOffset"], 0, MAX_LEDS - 1);
+      if (doc["ledSkip"].is<int>())         cfg.ledSkip     = constrain((int)doc["ledSkip"], 0, 10);
+      if (doc["ledReverse"].is<bool>())     cfg.ledReverse  = (bool)doc["ledReverse"];
+      if (doc["ledModel"].is<int>()) {
+        int newModel = constrain((int)doc["ledModel"], 0, 1);
+        if (newModel != cfg.ledModel) { cfg.ledModel = newModel; modelChanged = true; }
+      }
       FastLED.setBrightness(cfg.brightness);
       saveConfig();
-      if (utcChanged && wifiConnected && cfg.ntpEnabled) {
-        syncNTP();
-      }
-      req->send(200, "application/json", "{\"ok\":true}");
+      if (utcChanged && wifiConnected && cfg.ntpEnabled) syncNTP();
+      // Se il modello LED e' cambiato, la webapp fara' un /api/reconnect separato
+      req->send(200, "application/json", modelChanged ?
+        "{\"ok\":true,\"rebootRequired\":true}" :
+        "{\"ok\":true,\"rebootRequired\":false}"
+      );
     }
   );
 
@@ -421,21 +459,13 @@ void setup() {
   DBG.printf("DATA_PIN = %d\n", DATA_PIN);
 
   loadConfig();
+  initFastLED();
 
-  // Alloca sempre MAX_LEDS nel buffer FastLED
-  if (cfg.ledModel == 1) {
-    FastLED.addLeds<SK6812, DATA_PIN, GRB>(leds, MAX_LEDS).setCorrection(TypicalLEDStrip);
-    DBG.println("LED: SK6812");
-  } else {
-    FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, MAX_LEDS).setCorrection(TypicalLEDStrip);
-    DBG.println("LED: WS2812B");
-  }
-  FastLED.setBrightness(cfg.brightness);
   fill_solid(leds, MAX_LEDS, CRGB::Black);
   FastLED.show();
 
-  DBG.printf("Configurazione: %d LED anello, skip %d, offset %d\n",
-    cfg.numLeds, cfg.ledSkip, cfg.ledOffset);
+  DBG.printf("Config: %d LED, skip %d, offset %d, reverse %d, model %d\n",
+    cfg.numLeds, cfg.ledSkip, cfg.ledOffset, cfg.ledReverse, cfg.ledModel);
 
   littlefsOK = LittleFS.begin(true);
   DBG.println(littlefsOK ? "LittleFS OK" : "LittleFS FAILED - fallback attivo");
@@ -450,7 +480,7 @@ void setup() {
 
   setupWebServer();
 
-  // Startup sweep: illumina solo i LED dell'anello (dopo lo skip)
+  // Startup sweep sui soli LED dell'anello
   for (int i = 0; i < cfg.numLeds; i++) {
     fill_solid(leds, MAX_LEDS, CRGB::Black);
     leds[cfg.ledSkip + i] = CRGB(0, 50, 80);

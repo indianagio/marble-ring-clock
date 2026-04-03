@@ -54,8 +54,6 @@ header{display:flex;align-items:center;justify-content:space-between;padding:var
 .clock-wrap{display:flex;justify-content:center;padding:var(--sp-4) 0}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-4)}
 @media(max-width:500px){.grid-2{grid-template-columns:1fr}}
-.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--sp-3)}
-@media(max-width:500px){.grid-3{grid-template-columns:1fr}}
 .field{display:flex;flex-direction:column;gap:var(--sp-2);margin-bottom:var(--sp-4)}
 .field:last-child{margin-bottom:0}
 label{font-size:var(--tx-sm);font-weight:500;color:var(--text-muted)}
@@ -75,10 +73,13 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
 .btn-primary{background:var(--primary);color:#fff}.btn-primary:hover{background:var(--primary-hover)}
 .btn-ghost{background:transparent;color:var(--text-muted);border:1px solid var(--border)}
 .btn-ghost:hover{background:var(--surface-2);color:var(--text)}
+.btn-warn{background:var(--warn);color:#fff}
+.btn-warn:hover{opacity:.85}
 .btn-full{width:100%;justify-content:center}
 #toast{position:fixed;bottom:var(--sp-6);right:var(--sp-6);padding:var(--sp-3) var(--sp-5);border-radius:var(--r-lg);background:var(--primary);color:#fff;font-size:var(--tx-sm);font-weight:500;box-shadow:var(--shadow-md);opacity:0;transform:translateY(8px);transition:opacity .3s,transform .3s;pointer-events:none;z-index:100}
 #toast.show{opacity:1;transform:translateY(0)}
 #toast.err{background:var(--error)}
+#toast.warn{background:var(--warn)}
 .tabs{display:flex;gap:var(--sp-1);border-bottom:1px solid var(--divider);margin-bottom:var(--sp-5)}
 .tab{padding:var(--sp-2) var(--sp-4);font-size:var(--tx-sm);font-weight:500;color:var(--text-muted);border-radius:var(--r-md) var(--r-md) 0 0;border-bottom:2px solid transparent;transition:color var(--tr),border-color var(--tr)}
 .tab.active{color:var(--primary);border-bottom-color:var(--primary)}
@@ -95,6 +96,7 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
 .toggle-btn{width:40px;height:40px;display:flex;align-items:center;justify-content:center;border-radius:var(--r-md);color:var(--text-muted)}
 .toggle-btn:hover{background:var(--surface-2);color:var(--text)}
 .hint{font-size:var(--tx-xs);color:var(--text-faint);margin-top:var(--sp-1)}
+.badge-warn{display:inline-block;font-size:var(--tx-xs);color:var(--warn);border:1px solid var(--warn);border-radius:var(--r-full);padding:1px 8px;margin-left:var(--sp-2);vertical-align:middle}
 </style>
 </head>
 <body>
@@ -143,6 +145,20 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
         </div>
 
         <div class="tab-panel active" id="tab-led">
+
+          <!-- Modello LED -->
+          <div class="field">
+            <label>Modello LED <span class="badge-warn" id="model-reboot-badge" style="display:none">riavvio richiesto</span></label>
+            <select id="ledModel">
+              <option value="0">WS2812B</option>
+              <option value="1">SK6812</option>
+            </select>
+            <span class="hint">Il cambio modello viene salvato e applicato al prossimo riavvio</span>
+          </div>
+
+          <div class="sep"></div>
+
+          <!-- Numero LED e skip -->
           <div class="field">
             <label>Numero LED anello</label>
             <input type="number" id="numLeds" min="1" max="200" value="40">
@@ -151,8 +167,29 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
           <div class="field">
             <label>LED da saltare all'inizio (ledSkip)</label>
             <input type="number" id="ledSkip" min="0" max="10" value="1">
-            <span class="hint">Imposta 1 se usi ESP32-C3 Mini (LED onboard sul pin 8 va ignorato)</span>
+            <span class="hint">1 se usi ESP32-C3 Mini (LED onboard su pin 8 va ignorato)</span>
           </div>
+
+          <div class="sep"></div>
+
+          <!-- Orientamento -->
+          <div class="switch-row" style="margin-bottom:var(--sp-4)">
+            <div>
+              <div style="font-size:var(--tx-sm);font-weight:500">Inverti direzione</div>
+              <div style="font-size:var(--tx-xs);color:var(--text-muted)">Attiva se i LED sono verso la parete (scorrono in senso antiorario)</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="ledReverse"><span class="slider-sw"></span></label>
+          </div>
+
+          <div class="field">
+            <label>Offset rotazione &mdash; quale LED e' ore 12</label>
+            <input type="number" id="ledOffset" min="0" max="199" value="0">
+            <span class="hint">Aumenta finche' il LED delle 12 e' in cima all'anello</span>
+          </div>
+
+          <div class="sep"></div>
+
+          <!-- Mapping -->
           <div class="field">
             <label>Modalita mapping</label>
             <select id="mappingMode">
@@ -161,17 +198,15 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
               <option value="2">Usa tutti con spaziatura</option>
             </select>
           </div>
-          <div class="field">
-            <label>Offset rotazione — quale LED e' ore 12 (0 = primo LED dell'anello)</label>
-            <input type="number" id="ledOffset" min="0" max="199" value="0">
-            <span class="hint">Aumenta finche' il LED delle 12 e' in cima</span>
-          </div>
+
           <div class="sep"></div>
+
           <div class="field">
             <label>Luminosita globale</label>
             <div class="range-row"><input type="range" id="brightness" min="0" max="255" value="80"><span class="range-val" id="brightness-val">80</span></div>
           </div>
-          <button class="btn btn-primary btn-full" onclick="saveFields(['numLeds','ledSkip','mappingMode','ledOffset','brightness'])">Salva impostazioni LED</button>
+
+          <button class="btn btn-primary btn-full" id="save-led-btn" onclick="saveLed()">Salva impostazioni LED</button>
         </div>
 
         <div class="tab-panel" id="tab-colors">
@@ -210,8 +245,8 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
             <label>Fuso orario</label>
             <select id="utcOffsetSec">
               <option value="0">UTC+0 (GMT)</option>
-              <option value="3600">UTC+1 (CET — ora solare italiana)</option>
-              <option value="7200">UTC+2 (CEST — ora legale italiana)</option>
+              <option value="3600">UTC+1 (CET &mdash; ora solare italiana)</option>
+              <option value="7200">UTC+2 (CEST &mdash; ora legale italiana)</option>
               <option value="-3600">UTC-1</option>
               <option value="-18000">UTC-5 (EST)</option>
               <option value="-14400">UTC-4 (EDT)</option>
@@ -272,6 +307,16 @@ document.querySelectorAll('.tab').forEach(function(tab){
   if(el&&val){el.addEventListener('input',function(){val.textContent=el.value;});}
 });
 
+// Mostra badge "riavvio richiesto" se il modello LED cambia rispetto al valore caricato
+var loadedLedModel=0;
+document.getElementById('ledModel').addEventListener('change',function(){
+  var changed=parseInt(this.value)!==loadedLedModel;
+  document.getElementById('model-reboot-badge').style.display=changed?'inline':'none';
+  var btn=document.getElementById('save-led-btn');
+  btn.textContent=changed?'Salva e riavvia':'Salva impostazioni LED';
+  btn.className='btn btn-full '+(changed?'btn-warn':'btn-primary');
+});
+
 function updateColorDisplay(prefix){
   var picker=document.getElementById(prefix+'Color');
   var preview=document.getElementById(prefix+'ColorPreview');
@@ -287,12 +332,12 @@ function updateColorDisplay(prefix){
 });
 
 var toastTimer;
-function showToast(msg,isErr){
+function showToast(msg,type){
   var t=document.getElementById('toast');
   t.textContent=msg;
-  t.className='show'+(isErr?' err':'');
+  t.className='show'+(type?' '+type:'');
   clearTimeout(toastTimer);
-  toastTimer=setTimeout(function(){t.className='';},3000);
+  toastTimer=setTimeout(function(){t.className='';},3500);
 }
 
 var clock={h:0,m:0,s:0,lastSyncAt:0};
@@ -305,8 +350,7 @@ function fetchStatus(){
       state=d;
       var serverTotalS=(d.hour||0)*3600+(d.minute||0)*60+(d.second||0);
       var localTotalS=clock.h*3600+clock.m*60+clock.s;
-      var diff=Math.abs(serverTotalS-localTotalS);
-      if(diff>2||clock.lastSyncAt===0){
+      if(Math.abs(serverTotalS-localTotalS)>2||clock.lastSyncAt===0){
         clock.h=d.hour||0;clock.m=d.minute||0;clock.s=d.second||0;
         clock.lastSyncAt=Date.now();
       }
@@ -336,6 +380,7 @@ function updateFormFields(){
   sv('ledSkip',state.ledSkip!=null?state.ledSkip:1);
   sv('mappingMode',state.mappingMode||0);
   sv('ledOffset',state.ledOffset||0);
+  setChk('ledReverse',state.ledReverse||false);
   setRange('brightness',state.brightness||80);
   setRange('hourBrightness',state.hourBrightness||200);
   setRange('minBrightness',state.minBrightness||255);
@@ -348,6 +393,14 @@ function updateFormFields(){
   sv('manualHour',state.manualHour!=null?state.manualHour:-1);
   sv('manualMinute',state.manualMinute||0);
   sv('ssid',state.ssid||'');
+  // Aggiorna modello LED e resetta il badge
+  var m=state.ledModel||0;
+  sv('ledModel',m);
+  loadedLedModel=m;
+  document.getElementById('model-reboot-badge').style.display='none';
+  var btn=document.getElementById('save-led-btn');
+  btn.textContent='Salva impostazioni LED';
+  btn.className='btn btn-primary btn-full';
 }
 
 setInterval(function(){
@@ -365,13 +418,14 @@ setInterval(function(){
   var ledSkip=parseInt(document.getElementById('ledSkip').value)||0;
   var mapMode=parseInt(document.getElementById('mappingMode').value)||0;
   var ledOffset=parseInt(document.getElementById('ledOffset').value)||0;
+  var ledReverse=document.getElementById('ledReverse').checked;
   var hBri=parseInt(document.getElementById('hourBrightness').value)||200;
   var mBri=parseInt(document.getElementById('minBrightness').value)||255;
   function h2c(hex){if(!hex||hex.length<7)return{r:255,g:128,b:0};return{r:parseInt(hex.slice(1,3),16),g:parseInt(hex.slice(3,5),16),b:parseInt(hex.slice(5,7),16)};}
-  drawClock(clock.h,clock.m,numLeds,ledSkip,h2c(document.getElementById('hourColor').value),h2c(document.getElementById('minColor').value),hBri,mBri,mapMode,ledOffset);
+  drawClock(clock.h,clock.m,numLeds,ledSkip,ledReverse,h2c(document.getElementById('hourColor').value),h2c(document.getElementById('minColor').value),hBri,mBri,mapMode,ledOffset);
 },1000);
 
-function drawClock(hour,minute,numLeds,ledSkip,hc,mc,hBri,mBri,mapMode,ledOffset){
+function drawClock(hour,minute,numLeds,ledSkip,ledReverse,hc,mc,hBri,mBri,mapMode,ledOffset){
   var canvas=document.getElementById('clock-canvas');
   var ctx=canvas.getContext('2d');
   var W=canvas.width,H=canvas.height,cx=W/2,cy=H/2,R=W/2-14;
@@ -380,7 +434,6 @@ function drawClock(hour,minute,numLeds,ledSkip,hc,mc,hBri,mBri,mapMode,ledOffset
   ctx.arc(cx,cy,R,0,Math.PI*2);
   ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--border').trim();
   ctx.lineWidth=22;ctx.stroke();
-  // Disegna tutti i LED fisici: quelli skippati in grigio scuro, gli altri inattivi normali
   var total=ledSkip+numLeds;
   for(var i=0;i<total;i++){
     var a=(i/total)*Math.PI*2-Math.PI/2;
@@ -389,12 +442,14 @@ function drawClock(hour,minute,numLeds,ledSkip,hc,mc,hBri,mBri,mapMode,ledOffset
     ctx.fillStyle=i<ledSkip?'rgba(80,80,80,0.3)':getComputedStyle(document.documentElement).getPropertyValue('--divider').trim();
     ctx.fill();
   }
-  // Mapping logico->fisico (speculare al firmware)
+  // Speculare al firmware: offset poi eventuale inversione
   function ltp(logical){
     var pos;
     if(mapMode===1){pos=logical;if(pos>=numLeds)return -1;}
     else{pos=Math.round(logical*numLeds/60)%numLeds;}
-    return ledSkip+(pos+ledOffset)%numLeds;
+    pos=(pos+ledOffset)%numLeds;
+    if(ledReverse)pos=(numLeds-pos)%numLeds;
+    return ledSkip+pos;
   }
   var mPos=ltp(minute%60);
   var hFrac=(hour%12)*5+(minute/12);
@@ -416,18 +471,30 @@ function drawClock(hour,minute,numLeds,ledSkip,hc,mc,hBri,mBri,mapMode,ledOffset
   drawLed(hPos,hc,hBri);
 }
 
-function saveFields(fields){
-  var body={};
-  fields.forEach(function(f){
-    var el=document.getElementById(f);
-    if(!el)return;
-    if(el.type==='checkbox')body[f]=el.checked;
-    else body[f]=Number(el.value);
-  });
+function saveLed(){
+  var newModel=parseInt(document.getElementById('ledModel').value);
+  var modelChanged=newModel!==loadedLedModel;
+  var body={
+    numLeds:Number(document.getElementById('numLeds').value),
+    ledSkip:Number(document.getElementById('ledSkip').value),
+    ledOffset:Number(document.getElementById('ledOffset').value),
+    ledReverse:document.getElementById('ledReverse').checked,
+    brightness:Number(document.getElementById('brightness').value),
+    mappingMode:Number(document.getElementById('mappingMode').value),
+    ledModel:newModel
+  };
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(r){return r.json();})
-    .then(function(){showToast('Salvato!');fetchStatus();})
-    .catch(function(){showToast('Errore salvataggio',true);});
+    .then(function(d){
+      if(d.rebootRequired||modelChanged){
+        showToast('Tipo LED cambiato. Riavvio in corso...','warn');
+        setTimeout(function(){fetch('/api/reconnect',{method:'POST'});},1000);
+      } else {
+        showToast('Impostazioni LED salvate!');
+        fetchStatus();
+      }
+    })
+    .catch(function(){showToast('Errore salvataggio','err');});
 }
 
 function saveTimeSettings(){
@@ -443,7 +510,7 @@ function saveTimeSettings(){
       showToast('Fuso orario applicato!');
       setTimeout(function(){clock.lastSyncAt=0;fetchStatus();},2000);
     })
-    .catch(function(){showToast('Errore',true);});
+    .catch(function(){showToast('Errore','err');});
 }
 
 function saveColors(){
@@ -455,14 +522,14 @@ function saveColors(){
     minBrightness:Number(document.getElementById('minBrightness').value)};
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(){showToast('Colori salvati!');fetchStatus();})
-    .catch(function(){showToast('Errore',true);});
+    .catch(function(){showToast('Errore','err');});
 }
 
 function saveWifi(){
   var body={ssid:document.getElementById('ssid').value,password:document.getElementById('wifiPass').value};
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(){showToast('Credenziali salvate. Riavvio...');setTimeout(function(){fetch('/api/reconnect',{method:'POST'});},1500);})
-    .catch(function(){showToast('Errore',true);});
+    .catch(function(){showToast('Errore','err');});
 }
 
 function forceNTPSync(){
@@ -472,7 +539,7 @@ function forceNTPSync(){
       clock.lastSyncAt=0;
       setTimeout(fetchStatus,2500);
     })
-    .catch(function(){showToast('Errore',true);});
+    .catch(function(){showToast('Errore','err');});
 }
 
 fetchStatus();
