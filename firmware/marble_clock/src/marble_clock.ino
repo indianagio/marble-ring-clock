@@ -12,6 +12,17 @@
  */
 
 #include <Arduino.h>
+
+// ─── Serial: su C3 con USB-CDC occorre includere USB.h ───────────────────────
+#if defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE == 1
+  // ESP32-C3/S3 con USB-CDC nativo abilitato
+  #include <USB.h>
+  #define DBG USBSerial
+#else
+  // ESP32 classico (Lolin32 Lite, ecc.) — Serial hardware UART0
+  #define DBG Serial
+#endif
+
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
@@ -26,7 +37,7 @@
 #ifndef DATA_PIN_OVERRIDE
   #define DATA_PIN 22   // Lolin32 Lite default
 #else
-  #define DATA_PIN DATA_PIN_OVERRIDE  // override da platformio.ini (es. 8 per C3)
+  #define DATA_PIN DATA_PIN_OVERRIDE
 #endif
 
 #define MAX_LEDS         200
@@ -38,9 +49,6 @@
 // ─── NTP ─────────────────────────────────────────────────────────────────────
 #define NTP_SERVER       "pool.ntp.org"
 #define DEFAULT_UTC_OFFSET 3600  // UTC+1 CET
-
-// ─── Serial: su C3 con USB-CDC usiamo Serial (mappato su USB), ok su tutti ───
-#define DBG Serial
 
 // ─── Oggetti globali ─────────────────────────────────────────────────────────
 CRGB leds[MAX_LEDS];
@@ -299,7 +307,6 @@ void setupWebServer() {
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
-  // Su ESP32-C3 con -DARDUINO_USB_CDC_ON_BOOT=1, Serial usa USB-CDC nativamente
   DBG.begin(115200);
   delay(500);
   DBG.println("\n=== Marble Ring Clock ===");
