@@ -100,7 +100,6 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
 .sec-settings{transition:opacity .25s,filter .25s}
 .sec-settings.disabled{opacity:.35;pointer-events:none;filter:grayscale(1)}
 .sec-label{font-size:var(--tx-xs);color:var(--text-faint);text-align:center;margin-top:var(--sp-2)}
-/* Indicatore editing attivo */
 #editing-indicator{position:fixed;top:var(--sp-3);right:var(--sp-3);font-size:var(--tx-xs);color:var(--warn);background:var(--surface);border:1px solid var(--warn);border-radius:var(--r-full);padding:2px 10px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:200}
 #editing-indicator.visible{opacity:1}
 </style>
@@ -252,7 +251,8 @@ input[type=color]{width:48px;height:36px;padding:2px 4px;border-radius:var(--r-m
             </label>
           </div>
 
-          <div class="sec-settings disabled" id="sec-settings">
+          <!-- BUG FIX: rimossa classe 'disabled' hardcodata, ora gestita solo via JS -->
+          <div class="sec-settings" id="sec-settings">
             <div class="field">
               <label>Colore secondi</label>
               <div class="color-row">
@@ -357,7 +357,7 @@ document.getElementById('ledModel').addEventListener('change',function(){
 // -----------------------------------------------------------------------
 var userIsEditing=false;
 var editingTimer=null;
-var EDITING_GRACE_MS=8000; // 8s di inattività → riprende sync
+var EDITING_GRACE_MS=8000;
 
 function markEditing(){
   userIsEditing=true;
@@ -369,16 +369,6 @@ function markEditing(){
   },EDITING_GRACE_MS);
 }
 
-// Attacca il tracciamento a tutti gli input/select/checkbox/range nel form
-document.addEventListener('DOMContentLoaded',function(){
-  var formEls=document.querySelectorAll('input:not([type=button]),select,textarea');
-  formEls.forEach(function(el){
-    el.addEventListener('input',markEditing);
-    el.addEventListener('change',markEditing);
-    el.addEventListener('focus',markEditing);
-  });
-});
-// Anche subito (DOMContentLoaded potrebbe già essere passato)
 (function attachEditTracking(){
   var formEls=document.querySelectorAll('input:not([type=button]),select,textarea');
   formEls.forEach(function(el){
@@ -426,7 +416,6 @@ function fetchStatus(){
     .then(function(r){return r.json();})
     .then(function(d){
       state=d;
-      // Aggiorna sempre l'orologio locale (solo se scarta > 2s)
       var serverTotalS=(d.hour||0)*3600+(d.minute||0)*60+(d.second||0);
       var localTotalS=clock.h*3600+clock.m*60+clock.s;
       if(Math.abs(serverTotalS-localTotalS)>2||clock.lastSyncAt===0){
@@ -434,7 +423,6 @@ function fetchStatus(){
         clock.lastSyncAt=Date.now();
       }
       updateStatusBar();
-      // Aggiorna i campi del form SOLO se l'utente non sta modificando
       if(!userIsEditing){
         updateFormFields();
       }
@@ -467,10 +455,9 @@ function updateFormFields(){
   setRange('hourBrightness',state.hourBrightness||200);
   setRange('minBrightness',state.minBrightness||255);
   setRange('secBrightness',state.secBrightness!=null?state.secBrightness:160);
-  var showSec=state.showSeconds||false;
-  setChk('showSeconds',showSec);
-  document.getElementById('sec-settings').classList.toggle('disabled',!showSec);
-  document.getElementById('sec-preview-label').textContent=showSec?'':'Secondi disattivati';
+  // FIX: imposta checkbox E aggiorna il pannello CSS chiamando onShowSecondsChange()
+  setChk('showSeconds',state.showSeconds||false);
+  onShowSecondsChange();
   var hHex=toHex(state.hourR,state.hourG,state.hourB);
   var mHex=toHex(state.minR,state.minG,state.minB);
   var sHex=toHex(state.secR!=null?state.secR:200,state.secG||0,state.secB||0);
@@ -578,7 +565,6 @@ function saveLed(){
     mappingMode:Number(document.getElementById('mappingMode').value),
     ledModel:newModel
   };
-  // Resetta il flag editing prima di salvare, così il fetch post-save può aggiornare i campi
   userIsEditing=false;
   clearTimeout(editingTimer);
   document.getElementById('editing-indicator').classList.remove('visible');
