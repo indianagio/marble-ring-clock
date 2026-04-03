@@ -8,6 +8,9 @@
  *  - utcOffsetSec applicato subito senza reboot (timeClient reinizializzato)
  *  - ledOffset (rotazione anello) configurabile da webapp
  *  - LED 0 = ore 12 per default (offset 0)
+ *  - ledSkip: salta N LED all'inizio della striscia (es. LED onboard ESP32-C3)
+ *  - DATA_PIN default = 8 (WS2812 onboard ESP32-C3 Mini)
+ *  - DEFAULT_NUM_LEDS = 40 (anello di test)
  */
 
 #include <Arduino.h>
@@ -23,15 +26,18 @@
 
 #define DBG Serial0
 
+// DATA_PIN: usa pin 8 per ESP32-C3 Mini (WS2812 onboard + striscia esterna)
+// Override con -D DATA_PIN_OVERRIDE=X in platformio.ini se usi altro pin
 #ifndef DATA_PIN_OVERRIDE
-  #define DATA_PIN 5
+  #define DATA_PIN 8
 #else
   #define DATA_PIN DATA_PIN_OVERRIDE
 #endif
 
 #define MAX_LEDS           200
-#define DEFAULT_NUM_LEDS    70
+#define DEFAULT_NUM_LEDS    40   // anello di test con 40 LED
 #define DEFAULT_BRIGHTNESS  80
+#define DEFAULT_LED_SKIP     1   // salta il LED 0 (onboard ESP32-C3)
 #define NTP_SERVER         "pool.ntp.org"
 #define DEFAULT_UTC_OFFSET  3600
 
@@ -45,7 +51,7 @@ NTPClient      timeClient(ntpUDP, NTP_SERVER);
 struct Config {
   char    ssid[64];
   char    password[64];
-  int     numLeds;
+  int     numLeds;        // LED dell'anello (non conteggia quelli skippati)
   int     brightness;
   uint8_t hourR, hourG, hourB;
   uint8_t minR,  minG,  minB;
@@ -56,9 +62,10 @@ struct Config {
   int     manualMinute;
   bool    ntpEnabled;
   int     ledDensity;
-  int     mappingMode;  // 0=spread, 1=first60, 2=all-with-gap
+  int     mappingMode;  // 0=spread (consigliato), 1=first60, 2=all-with-gap
   int     ledModel;     // 0=WS2812B, 1=SK6812
   int     ledOffset;    // rotazione: quale LED fisico corrisponde a ore 12
+  int     ledSkip;      // quanti LED saltare all'inizio (es. 1 per LED onboard C3)
 } cfg;
 
 bool wifiConnected = false;
@@ -90,6 +97,7 @@ void loadConfig() {
   cfg.mappingMode    = prefs.getInt("mapMode",   0);
   cfg.ledModel       = prefs.getInt("ledModel",  0);
   cfg.ledOffset      = prefs.getInt("ledOffset", 0);
+  cfg.ledSkip        = prefs.getInt("ledSkip",   DEFAULT_LED_SKIP);
   prefs.end();
 }
 
@@ -115,51 +123,62 @@ void saveConfig() {
   prefs.putInt("mapMode",  cfg.mappingMode);
   prefs.putInt("ledModel", cfg.ledModel);
   prefs.putInt("ledOffset",cfg.ledOffset);
+  prefs.putInt("ledSkip",  cfg.ledSkip);
   prefs.end();
 }
 
 // --- LED mapping -------------------------------------------------------------
 // logicalToPhysical: mappa posizione logica (0-59) -> indice fisico LED
-// Tiene conto di ledOffset (rotazione) e mappingMode
-int logicalToPhysical(int logical, int totalLeds, int mode, int offset) {
-  if (totalLeds <= 0) return 0;
+// Tiene conto di:
+//   ledSkip  : offset iniziale fisso (LED saltati, es. LED onboard)
+//   ledOffset: rotazione dell'anello (quale LED fisico = ore 12)
+//   mappingMode: come distribuire 60 posizioni logiche su numLeds fisici
+//
+// Il buffer FastLED ha dimensione MAX_LEDS;
+// i LED [0..ledSkip-1] vengono sempre tenuti a nero in renderClock.
+int logicalToPhysical(int logical, int totalLeds, int mode, int offset, int skip) {
+  if (totalLeds <= 0) return -1;
   int pos;
   switch (mode) {
     case 1:
+      // Usa direttamente i primi 60 indici dell'anello
       pos = logical;
       if (pos >= totalLeds) return -1;
       break;
     case 0:
     case 2:
     default:
+      // Distribuisce le 60 posizioni logiche uniformemente sui totalLeds LED
       pos = (int)round((float)logical * totalLeds / 60.0f) % totalLeds;
       break;
   }
-  // Applica rotazione: offset sposta il punto "ore 12"
-  return (pos + offset) % totalLeds;
+  // Applica rotazione anello, poi aggiunge lo skip iniziale
+  return skip + (pos + offset) % totalLeds;
 }
 
 // --- Clock rendering ---------------------------------------------------------
 void renderClock(int hour24, int minute) {
-  fill_solid(leds, cfg.numLeds, CRGB::Black);
+  // Spegni tutto il buffer (include LED skippati)
+  fill_solid(leds, cfg.ledSkip + cfg.numLeds, CRGB::Black);
 
-  int minPos = logicalToPhysical(minute % 60, cfg.numLeds, cfg.mappingMode, cfg.ledOffset);
+  int minPos = logicalToPhysical(minute % 60, cfg.numLeds, cfg.mappingMode, cfg.ledOffset, cfg.ledSkip);
   CRGB mc(
     (cfg.minR  * cfg.minBrightness)  / 255,
     (cfg.minG  * cfg.minBrightness)  / 255,
     (cfg.minB  * cfg.minBrightness)  / 255
   );
-  if (minPos >= 0 && minPos < cfg.numLeds) leds[minPos] = mc;
+  if (minPos >= cfg.ledSkip && minPos < cfg.ledSkip + cfg.numLeds)
+    leds[minPos] = mc;
 
   float hourFrac    = (hour24 % 12) * 5.0f + (minute / 12.0f);
   int   hourLogical = (int)round(hourFrac) % 60;
-  int   hourPos     = logicalToPhysical(hourLogical, cfg.numLeds, cfg.mappingMode, cfg.ledOffset);
+  int   hourPos     = logicalToPhysical(hourLogical, cfg.numLeds, cfg.mappingMode, cfg.ledOffset, cfg.ledSkip);
   CRGB hc(
     (cfg.hourR * cfg.hourBrightness) / 255,
     (cfg.hourG * cfg.hourBrightness) / 255,
     (cfg.hourB * cfg.hourBrightness) / 255
   );
-  if (hourPos >= 0 && hourPos < cfg.numLeds) {
+  if (hourPos >= cfg.ledSkip && hourPos < cfg.ledSkip + cfg.numLeds) {
     leds[hourPos] = (hourPos == minPos) ? blend(hc, mc, 128) : hc;
   }
 
@@ -194,12 +213,10 @@ void connectWiFi() {
 }
 
 // --- NTP ---------------------------------------------------------------------
-// Reinizializza sempre il timeClient con l'offset corrente.
-// Chiamata sia all'avvio che ogni volta che si salva utcOffsetSec dalla webapp.
 void syncNTP() {
   if (!wifiConnected || !cfg.ntpEnabled) return;
-  timeClient.end();                          // chiudi connessione precedente
-  timeClient.setTimeOffset(cfg.utcOffsetSec); // applica nuovo offset
+  timeClient.end();
+  timeClient.setTimeOffset(cfg.utcOffsetSec);
   timeClient.begin();
   if (timeClient.forceUpdate()) {
     ntpSynced   = true;
@@ -228,15 +245,16 @@ static const char FALLBACK_HTML[] PROGMEM =
 "<h2>WiFi</h2><input id='ssid' placeholder='SSID'><input id='pass' type='password' placeholder='Password'>"
 "<h2>LED</h2>"
 "<label>Tipo LED</label><select id='ledModel'><option value='0'>WS2812B</option><option value='1'>SK6812</option></select>"
-"<label>Numero LED</label><input id='numLeds' type='number' min='1' max='200'>"
-"<label>Offset rotazione (0 = LED0 a ore 12)</label><input id='ledOffset' type='number' min='0' max='199'>"
+"<label>Numero LED anello</label><input id='numLeds' type='number' min='1' max='200'>"
+"<label>LED da saltare all'inizio (ledSkip, es. 1 per LED onboard C3)</label><input id='ledSkip' type='number' min='0' max='10'>"
+"<label>Offset rotazione (0 = primo LED dell'anello a ore 12)</label><input id='ledOffset' type='number' min='0' max='199'>"
 "<label>Luminosita globale</label><input id='brightness' type='range' min='0' max='255'>"
-"<h2>Colori lancetta ORE (R G B)</h2>"
+"<h2>Colori ORE (R G B)</h2>"
 "<div class='row'><input id='hR' type='number' min='0' max='255' placeholder='R'>"
 "<input id='hG' type='number' min='0' max='255' placeholder='G'>"
 "<input id='hB' type='number' min='0' max='255' placeholder='B'></div>"
 "<label>Intensita ore</label><input id='hBri' type='range' min='0' max='255'>"
-"<h2>Colori lancetta MINUTI (R G B)</h2>"
+"<h2>Colori MINUTI (R G B)</h2>"
 "<div class='row'><input id='mR' type='number' min='0' max='255' placeholder='R'>"
 "<input id='mG' type='number' min='0' max='255' placeholder='G'>"
 "<input id='mB' type='number' min='0' max='255' placeholder='B'></div>"
@@ -257,6 +275,7 @@ static const char FALLBACK_HTML[] PROGMEM =
 "+` | NTP: <span class='${d.ntpSynced?'ok':'err'}'>${d.ntpSynced?d.hour+':'+String(d.minute).padStart(2,'0'):'no sync'}</span>`;"
 "document.getElementById('ssid').value=d.ssid||'';"
 "document.getElementById('numLeds').value=d.numLeds;"
+"document.getElementById('ledSkip').value=d.ledSkip!=null?d.ledSkip:1;"
 "document.getElementById('ledOffset').value=d.ledOffset||0;"
 "document.getElementById('brightness').value=d.brightness;"
 "document.getElementById('hR').value=d.hourR;document.getElementById('hG').value=d.hourG;document.getElementById('hB').value=d.hourB;"
@@ -269,8 +288,8 @@ static const char FALLBACK_HTML[] PROGMEM =
 "}catch(e){document.getElementById('st').innerHTML=\"<span class='err'>Errore connessione</span>\";}"
 "}"
 "async function save(){const body={ssid:document.getElementById('ssid').value,password:document.getElementById('pass').value,"
-"numLeds:+document.getElementById('numLeds').value,ledOffset:+document.getElementById('ledOffset').value,"
-"brightness:+document.getElementById('brightness').value,"
+"numLeds:+document.getElementById('numLeds').value,ledSkip:+document.getElementById('ledSkip').value,"
+"ledOffset:+document.getElementById('ledOffset').value,brightness:+document.getElementById('brightness').value,"
 "hourR:+document.getElementById('hR').value,hourG:+document.getElementById('hG').value,hourB:+document.getElementById('hB').value,"
 "minR:+document.getElementById('mR').value,minG:+document.getElementById('mG').value,minB:+document.getElementById('mB').value,"
 "hourBrightness:+document.getElementById('hBri').value,minBrightness:+document.getElementById('mBri').value,"
@@ -298,9 +317,16 @@ void setupWebServer() {
 
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *req) {
     JsonDocument doc;
-    doc["hour"]           = timeClient.getHours();
-    doc["minute"]         = timeClient.getMinutes();
-    doc["second"]         = timeClient.getSeconds();
+    // Ora corrente: manuale se impostata, altrimenti NTP
+    if (cfg.manualHour >= 0) {
+      doc["hour"]   = cfg.manualHour;
+      doc["minute"] = cfg.manualMinute;
+      doc["second"] = 0;
+    } else {
+      doc["hour"]   = timeClient.getHours();
+      doc["minute"] = timeClient.getMinutes();
+      doc["second"] = timeClient.getSeconds();
+    }
     doc["ntpSynced"]      = ntpSynced;
     doc["wifiConnected"]  = wifiConnected;
     doc["ip"]             = wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
@@ -323,6 +349,7 @@ void setupWebServer() {
     doc["manualMinute"]   = cfg.manualMinute;
     doc["ledModel"]       = cfg.ledModel;
     doc["ledOffset"]      = cfg.ledOffset;
+    doc["ledSkip"]        = cfg.ledSkip;
     String json;
     serializeJson(doc, json);
     req->send(200, "application/json", json);
@@ -361,9 +388,9 @@ void setupWebServer() {
       if (doc["manualMinute"].is<int>())     cfg.manualMinute   = constrain((int)doc["manualMinute"], 0, 59);
       if (doc["ledModel"].is<int>())         cfg.ledModel       = constrain((int)doc["ledModel"], 0, 1);
       if (doc["ledOffset"].is<int>())        cfg.ledOffset      = constrain((int)doc["ledOffset"], 0, MAX_LEDS - 1);
+      if (doc["ledSkip"].is<int>())          cfg.ledSkip        = constrain((int)doc["ledSkip"], 0, 10);
       FastLED.setBrightness(cfg.brightness);
       saveConfig();
-      // Se l'offset UTC e' cambiato, risincronizza subito senza reboot
       if (utcChanged && wifiConnected && cfg.ntpEnabled) {
         syncNTP();
       }
@@ -395,6 +422,7 @@ void setup() {
 
   loadConfig();
 
+  // Alloca sempre MAX_LEDS nel buffer FastLED
   if (cfg.ledModel == 1) {
     FastLED.addLeds<SK6812, DATA_PIN, GRB>(leds, MAX_LEDS).setCorrection(TypicalLEDStrip);
     DBG.println("LED: SK6812");
@@ -403,8 +431,11 @@ void setup() {
     DBG.println("LED: WS2812B");
   }
   FastLED.setBrightness(cfg.brightness);
-  fill_solid(leds, cfg.numLeds, CRGB::Black);
+  fill_solid(leds, MAX_LEDS, CRGB::Black);
   FastLED.show();
+
+  DBG.printf("Configurazione: %d LED anello, skip %d, offset %d\n",
+    cfg.numLeds, cfg.ledSkip, cfg.ledOffset);
 
   littlefsOK = LittleFS.begin(true);
   DBG.println(littlefsOK ? "LittleFS OK" : "LittleFS FAILED - fallback attivo");
@@ -419,14 +450,14 @@ void setup() {
 
   setupWebServer();
 
-  // Startup sweep
+  // Startup sweep: illumina solo i LED dell'anello (dopo lo skip)
   for (int i = 0; i < cfg.numLeds; i++) {
-    fill_solid(leds, cfg.numLeds, CRGB::Black);
-    leds[i] = CRGB(0, 50, 80);
+    fill_solid(leds, MAX_LEDS, CRGB::Black);
+    leds[cfg.ledSkip + i] = CRGB(0, 50, 80);
     FastLED.show();
     delay(20);
   }
-  fill_solid(leds, cfg.numLeds, CRGB::Black);
+  fill_solid(leds, MAX_LEDS, CRGB::Black);
   FastLED.show();
 
   DBG.println("Setup done.");
