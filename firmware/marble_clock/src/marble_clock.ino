@@ -4,8 +4,17 @@
  *
  * Board: Lolin32 Lite (target) / ESP32-C3 Mini (test)
  *
+ * Note SK6812: FastLED 3.9+ ha rimosso CRGBW. Usiamo un buffer CRGB
+ * per i primi 3 canali e un array raw uint8_t per il canale W (bianco).
+ * FastLED.show() usa solo il buffer CRGB; il canale W viene iniettato
+ * direttamente nel buffer SPI via CLEDController::setRawData (non serve).
+ * Approccio scelto: W=0 sempre (SK6812 usato come RGB puro, canale W spento).
+ * Questo è il comportamento più semplice e corretto per un orologio a colori.
+ * Se vuoi il bianco puro, imposta R=G=B=0 e usa l'API /api/config con un
+ * parametro futuro "whiteChannel". Per ora W=0.
+ *
  * Libraries:
- *   FastLED, ESPAsyncWebServer-esphome, AsyncTCP-esphome,
+ *   FastLED >= 3.9, ESPAsyncWebServer-esphome, AsyncTCP-esphome,
  *   NTPClient, ArduinoJson, LittleFS, Preferences, ArduinoOTA
  */
 
@@ -30,23 +39,25 @@
   #define DATA_PIN DATA_PIN_OVERRIDE
 #endif
 
-// ─── LED type selector ───────────────────────────────────────────────────────
-// LED_MODEL: 0 = WS2812B (GRB), 1 = SK6812 (GRBW)
+// ─── LED constants ───────────────────────────────────────────────────────────
 #define MAX_LEDS          200
 #define DEFAULT_NUM_LEDS   70
-#define DEFAULT_BRIGHTNESS 80
+#define DEFAULT_BRIGHTNESS  80
 
 // ─── NTP ─────────────────────────────────────────────────────────────────────
 #define NTP_SERVER        "pool.ntp.org"
 #define DEFAULT_UTC_OFFSET 3600  // UTC+1 CET
 
 // ─── Oggetti globali ─────────────────────────────────────────────────────────
-CRGB  leds_rgb[MAX_LEDS];   // WS2812B
-CRGBW leds_rgbw[MAX_LEDS];  // SK6812
-Preferences prefs;
+// Un solo buffer CRGB — funziona sia per WS2812B che SK6812 (W=0).
+// SK6812 in FastLED 3.9+: si usa SK6812 come tipo, il 4° byte (W) viene
+// trasmesso come 0x00 automaticamente dal controller SK6812.
+CRGB leds[MAX_LEDS];
+
+Preferences    prefs;
 AsyncWebServer server(80);
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, NTP_SERVER);
+WiFiUDP        ntpUDP;
+NTPClient      timeClient(ntpUDP, NTP_SERVER);
 
 // ─── Struttura configurazione ────────────────────────────────────────────────
 struct Config {
@@ -63,7 +74,7 @@ struct Config {
   int     manualMinute;
   bool    ntpEnabled;
   int     ledDensity;
-  int     mappingMode;   // 0=distribuiti, 1=primi 60, 2=tutti con gap
+  int     mappingMode;   // 0=distribuiti, 1=primi60, 2=tutti con gap
   int     ledModel;      // 0=WS2812B, 1=SK6812
 } cfg;
 
@@ -95,7 +106,7 @@ void loadConfig() {
   cfg.ntpEnabled     = prefs.getBool("ntpEn",     true);
   cfg.ledDensity     = prefs.getInt("density",    60);
   cfg.mappingMode    = prefs.getInt("mapMode",    0);
-  cfg.ledModel       = prefs.getInt("ledModel",   0);  // 0=WS2812B default
+  cfg.ledModel       = prefs.getInt("ledModel",   0);
   prefs.end();
 }
 
@@ -123,38 +134,6 @@ void saveConfig() {
   prefs.end();
 }
 
-// ─── FastLED helpers ─────────────────────────────────────────────────────────
-void ledsShow() {
-  FastLED.show();
-}
-
-void ledsFill(CRGB color) {
-  if (cfg.ledModel == 1) {
-    CRGBW c(color.r, color.g, color.b, 0);
-    for (int i = 0; i < cfg.numLeds; i++) leds_rgbw[i] = c;
-  } else {
-    fill_solid(leds_rgb, cfg.numLeds, color);
-  }
-}
-
-void ledSet(int i, CRGB color) {
-  if (i < 0 || i >= cfg.numLeds) return;
-  if (cfg.ledModel == 1) {
-    leds_rgbw[i] = CRGBW(color.r, color.g, color.b, 0);
-  } else {
-    leds_rgb[i] = color;
-  }
-}
-
-CRGB ledGet(int i) {
-  if (i < 0 || i >= cfg.numLeds) return CRGB::Black;
-  if (cfg.ledModel == 1) {
-    return CRGB(leds_rgbw[i].r, leds_rgbw[i].g, leds_rgbw[i].b);
-  } else {
-    return leds_rgb[i];
-  }
-}
-
 // ─── LED mapping ─────────────────────────────────────────────────────────────
 int logicalToPhysical(int logical, int totalLeds, int mode) {
   if (totalLeds <= 0) return 0;
@@ -170,16 +149,18 @@ int logicalToPhysical(int logical, int totalLeds, int mode) {
 
 // ─── Rendering orologio ──────────────────────────────────────────────────────
 void renderClock(int hour24, int minute) {
-  ledsFill(CRGB::Black);
+  fill_solid(leds, cfg.numLeds, CRGB::Black);
 
+  // Lancetta minuti
   int minPos = logicalToPhysical(minute % 60, cfg.numLeds, cfg.mappingMode);
   CRGB mc(
-    (cfg.minR * cfg.minBrightness) / 255,
-    (cfg.minG * cfg.minBrightness) / 255,
-    (cfg.minB * cfg.minBrightness) / 255
+    (cfg.minR  * cfg.minBrightness) / 255,
+    (cfg.minG  * cfg.minBrightness) / 255,
+    (cfg.minB  * cfg.minBrightness) / 255
   );
-  ledSet(minPos, mc);
+  if (minPos >= 0 && minPos < cfg.numLeds) leds[minPos] = mc;
 
+  // Lancetta ore (progredisce tra i minuti)
   float hourFrac    = (hour24 % 12) * 5.0f + (minute / 12.0f);
   int   hourLogical = (int)round(hourFrac) % 60;
   int   hourPos     = logicalToPhysical(hourLogical, cfg.numLeds, cfg.mappingMode);
@@ -188,19 +169,21 @@ void renderClock(int hour24, int minute) {
     (cfg.hourG * cfg.hourBrightness) / 255,
     (cfg.hourB * cfg.hourBrightness) / 255
   );
-  if (hourPos == minPos) {
-    ledSet(hourPos, blend(hc, mc, 128));
-  } else {
-    ledSet(hourPos, hc);
+  if (hourPos >= 0 && hourPos < cfg.numLeds) {
+    if (hourPos == minPos) {
+      leds[hourPos] = blend(hc, mc, 128);
+    } else {
+      leds[hourPos] = hc;
+    }
   }
 
-  ledsShow();
+  FastLED.show();
 }
 
-// ─── WiFi ────────────────────────────────────────────────────────────────────
+// ─── WiFi ─────────────────────────────────────────────────────────────────────
 void connectWiFi() {
   if (strlen(cfg.ssid) == 0) {
-    DBG.println("No SSID → AP mode");
+    DBG.println("No SSID -> AP mode");
     WiFi.mode(WIFI_AP);
     WiFi.softAP("MarbleClock", "clock1234");
     DBG.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
@@ -217,7 +200,7 @@ void connectWiFi() {
     wifiConnected = true;
     DBG.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
   } else {
-    DBG.println("\nFailed → AP mode");
+    DBG.println("\nFailed -> AP mode");
     WiFi.mode(WIFI_AP);
     WiFi.softAP("MarbleClock", "clock1234");
     DBG.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
@@ -237,8 +220,9 @@ void syncNTP() {
   }
 }
 
-// ─── HTML inline di fallback (usato se LittleFS non ha index.html) ───────────
-// Permette di configurare WiFi anche senza uploadfs
+// ─── HTML inline fallback ────────────────────────────────────────────────────
+// Servito se LittleFS non e' montato o index.html manca.
+// Permette di configurare WiFi anche senza uploadfs.
 static const char FALLBACK_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html><html><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
@@ -263,21 +247,21 @@ button:hover{background:#0c4e54}
 <label>Tipo LED</label>
 <select id='ledModel'><option value='0'>WS2812B</option><option value='1'>SK6812 (RGBW)</option></select>
 <label>Numero LED</label><input id='numLeds' type='number' min='1' max='200'>
-<label>Luminosit&agrave; globale (0-255)</label><input id='brightness' type='range' min='0' max='255'>
+<label>Luminosita globale (0-255)</label><input id='brightness' type='range' min='0' max='255'>
 <h2>Colore Ore</h2>
 <div class='row'><input id='hR' type='number' min='0' max='255' placeholder='R'><input id='hG' type='number' min='0' max='255' placeholder='G'><input id='hB' type='number' min='0' max='255' placeholder='B'></div>
-<label>Intensit&agrave; lancetta ore</label><input id='hBri' type='range' min='0' max='255'>
+<label>Intensita lancetta ore</label><input id='hBri' type='range' min='0' max='255'>
 <h2>Colore Minuti</h2>
 <div class='row'><input id='mR' type='number' min='0' max='255' placeholder='R'><input id='mG' type='number' min='0' max='255' placeholder='G'><input id='mB' type='number' min='0' max='255' placeholder='B'></div>
-<label>Intensit&agrave; lancetta minuti</label><input id='mBri' type='range' min='0' max='255'>
+<label>Intensita lancetta minuti</label><input id='mBri' type='range' min='0' max='255'>
 <h2>Orario</h2>
-<label>Fuso orario (offset UTC in secondi, es. 3600=CET)</label>
+<label>Fuso orario (secondi UTC, es. 3600=CET)</label>
 <input id='utcOff' type='number'>
 <label>Ora manuale (-1 = usa NTP)</label>
-<div class='row'><input id='manH' type='number' min='-1' max='23' placeholder='Ora (-1=NTP)'><input id='manM' type='number' min='0' max='59' placeholder='Min'></div>
+<div class='row'><input id='manH' type='number' min='-1' max='23' placeholder='Ora'><input id='manM' type='number' min='0' max='59' placeholder='Min'></div>
 <h2>Mapping LED</h2>
 <select id='mapMode'><option value='0'>Distribuiti (consigliato)</option><option value='1'>Primi 60</option><option value='2'>Tutti con gap</option></select>
-<br>
+<br><br>
 <button onclick='save()'>&#128190; Salva &amp; Applica</button>
 <button onclick='syncNTP()'>&#128337; Sync NTP</button>
 <button onclick='reboot()'>&#128260; Riavvia</button>
@@ -311,7 +295,7 @@ async function save(){
     manualHour:+document.getElementById('manH').value,manualMinute:+document.getElementById('manM').value,
     mappingMode:+document.getElementById('mapMode').value,ledModel:+document.getElementById('ledModel').value};
   await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  alert('Salvato!');
+  alert('Salvato! Riavvia per applicare cambio tipo LED.');
 }
 async function syncNTP(){await fetch('/api/syncntp',{method:'POST'});alert('NTP sync avviato');}
 async function reboot(){await fetch('/api/reconnect',{method:'POST'});alert('Riavvio...');}
@@ -321,12 +305,10 @@ load();
 
 // ─── Web server ───────────────────────────────────────────────────────────────
 void setupWebServer() {
-  // Serve LittleFS se disponibile, altrimenti usa fallback HTML inline
   if (littlefsOK) {
     server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
   }
 
-  // Fallback root — risponde sempre, anche senza LittleFS
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
     if (!littlefsOK || !LittleFS.exists("/index.html")) {
       req->send_P(200, "text/html", FALLBACK_HTML);
@@ -423,27 +405,28 @@ void setup() {
 
   loadConfig();
 
-  // Inizializza FastLED in base al modello LED
+  // FastLED: SK6812 e WS2812B usano entrambi buffer CRGB in FastLED 3.9+
+  // Il tipo SK6812 trasmette 4 byte per LED (GRBW) con W=0 automaticamente.
   if (cfg.ledModel == 1) {
-    FastLED.addLeds<SK6812, DATA_PIN, RGB>(leds_rgbw, MAX_LEDS)
+    FastLED.addLeds<SK6812, DATA_PIN, GRB>(leds, MAX_LEDS)
            .setCorrection(TypicalLEDStrip);
-    DBG.println("LED: SK6812 (RGBW)");
+    DBG.println("LED: SK6812 (W=0, RGB mode)");
   } else {
-    FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds_rgb, MAX_LEDS)
+    FastLED.addLeds<WS2812B, DATA_PIN, GRB>(leds, MAX_LEDS)
            .setCorrection(TypicalLEDStrip);
-    DBG.println("LED: WS2812B (GRB)");
+    DBG.println("LED: WS2812B");
   }
   FastLED.setBrightness(cfg.brightness);
-  ledsFill(CRGB::Black);
-  ledsShow();
+  fill_solid(leds, cfg.numLeds, CRGB::Black);
+  FastLED.show();
 
   littlefsOK = LittleFS.begin(true);
   if (!littlefsOK) {
-    DBG.println("LittleFS FAILED — using inline HTML fallback");
+    DBG.println("LittleFS FAILED - using inline fallback");
   } else {
     DBG.println("LittleFS OK");
     if (!LittleFS.exists("/index.html")) {
-      DBG.println("index.html not found — using inline fallback");
+      DBG.println("index.html missing - using inline fallback");
     }
   }
 
@@ -455,15 +438,15 @@ void setup() {
 
   setupWebServer();
 
-  // Animazione avvio
+  // Animazione avvio: sweep
   for (int i = 0; i < cfg.numLeds; i++) {
-    ledsFill(CRGB::Black);
-    ledSet(i, CRGB(0, 50, 80));
-    ledsShow();
+    fill_solid(leds, cfg.numLeds, CRGB::Black);
+    leds[i] = CRGB(0, 50, 80);
+    FastLED.show();
     delay(20);
   }
-  ledsFill(CRGB::Black);
-  ledsShow();
+  fill_solid(leds, cfg.numLeds, CRGB::Black);
+  FastLED.show();
 
   DBG.println("Setup done.");
 }
@@ -472,11 +455,13 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
 
+  // Resync NTP ogni ora
   if (wifiConnected && cfg.ntpEnabled &&
       (millis() - lastNTPSync > 3600000UL || lastNTPSync == 0)) {
     syncNTP();
   }
 
+  // Aggiorna display ogni secondo
   if (millis() - lastUpdate > 1000) {
     lastUpdate = millis();
     int h, m;
