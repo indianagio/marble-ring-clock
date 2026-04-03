@@ -5,23 +5,17 @@
  * Board: Lolin32 Lite (target) / ESP32-C3 Mini (test)
  *
  * Fix log:
- *  - utcOffsetSec applicato subito senza reboot (timeClient reinizializzato)
- *  - ledOffset (rotazione anello) configurabile da webapp
- *  - LED 0 = ore 12 per default (offset 0)
- *  - ledSkip: salta N LED all'inizio della striscia (es. LED onboard ESP32-C3)
- *  - DATA_PIN default = 8 (WS2812 onboard ESP32-C3 Mini)
- *  - DEFAULT_NUM_LEDS = 40 (anello di test)
- *  - ledReverse: inverte la direzione di scorrimento dell'anello
- *  - ledModel modificabile dalla webapp (richiede reboot per reinit FastLED)
- *  - showSeconds: lancetta secondi on/off + colore/intensità configurabili
- *  - FIX v1: ArduinoJson v7 - doc[x].is<bool>() non funziona per booleani JSON nativi.
- *  - FIX v2: jsonBool() accedeva doc[key] due volte. Soluzione: JsonVariant locale.
- *  - FIX v3: /api/status mandava showSeconds e ledReverse come interi 0/1.
- *    Il JS confrontava con === true (confronto stretto) → checkbox sempre falsa
- *    al reload → al salvataggio successivo sovrascriveva false.
- *    SOLUZIONE: /api/status ora manda SEMPRE bool nativi JSON (true/false).
- *    Il JS usa !!d.showSeconds per coercizione robusta (funziona con bool e int).
- *    readJsonBool() usata per TUTTI i campi booleani in /api/config.
+ *  - utcOffsetSec applicato subito senza reboot
+ *  - ledOffset configurabile da webapp
+ *  - ledSkip: salta N LED iniziali
+ *  - ledReverse: inverte direzione anello
+ *  - showSeconds: lancetta secondi on/off
+ *  - FIX v3: /api/status manda bool nativi JSON
+ *  - FIX v4: ESP32-C3 usa Serial0, ARDUINO_USB_MODE=1
+ *  - FEAT v5: trail/fade per ogni lancetta (trailBefore, trailAfter, trailDecay)
+ *    Ogni lancetta ha code/sfumature indipendenti prima e dopo il LED centrale.
+ *    trailDecay: 0-100 (percentuale di luminosita residua per ogni step).
+ *    Esempio: decay=60 -> step1=60%, step2=36%, step3=22% del LED centrale.
  */
 
 #include <Arduino.h>
@@ -79,6 +73,16 @@ struct Config {
   int     ledOffset;
   int     ledSkip;
   bool    ledReverse;
+  // Trail / fade per ogni lancetta
+  int     hourTrailBefore;   // LED sfumati prima della lancetta ore
+  int     hourTrailAfter;    // LED sfumati dopo la lancetta ore
+  int     hourTrailDecay;    // decay % per step ore (0-100)
+  int     minTrailBefore;
+  int     minTrailAfter;
+  int     minTrailDecay;
+  int     secTrailBefore;
+  int     secTrailAfter;
+  int     secTrailDecay;
 } cfg;
 
 bool wifiConnected = false;
@@ -87,15 +91,9 @@ bool littlefsOK    = false;
 unsigned long lastNTPSync = 0;
 unsigned long lastUpdate  = 0;
 
-// ---------------------------------------------------------------------------
-// Legge un campo booleano da JsonDocument in modo sicuro per ArduinoJson v7.
-// Accede doc[key] UNA SOLA VOLTA tramite JsonVariant locale.
-// Accetta sia bool nativi (true/false) che interi (0/1).
-// ---------------------------------------------------------------------------
 static inline bool readJsonBool(JsonDocument& doc, const char* key, bool fallback) {
   JsonVariant v = doc[key];
   if (v.isNull()) return fallback;
-  // .as<bool>() su intero: 0→false, qualsiasi altro valore→true. Corretto.
   return v.as<bool>();
 }
 
@@ -129,9 +127,17 @@ void loadConfig() {
   cfg.ledOffset      = prefs.getInt("ledOffset",   0);
   cfg.ledSkip        = prefs.getInt("ledSkip",     DEFAULT_LED_SKIP);
   cfg.ledReverse     = prefs.getBool("ledReverse", false);
+  // Trail defaults: 2 LED prima, 2 dopo, decay 50%
+  cfg.hourTrailBefore = prefs.getInt("hTB",  2);
+  cfg.hourTrailAfter  = prefs.getInt("hTA",  2);
+  cfg.hourTrailDecay  = prefs.getInt("hTD",  50);
+  cfg.minTrailBefore  = prefs.getInt("mTB",  2);
+  cfg.minTrailAfter   = prefs.getInt("mTA",  2);
+  cfg.minTrailDecay   = prefs.getInt("mTD",  50);
+  cfg.secTrailBefore  = prefs.getInt("sTB",  1);
+  cfg.secTrailAfter   = prefs.getInt("sTA",  1);
+  cfg.secTrailDecay   = prefs.getInt("sTD",  40);
   prefs.end();
-  DBG.printf("loadConfig: showSec=%d ntpEn=%d ledRev=%d\n",
-    cfg.showSeconds, cfg.ntpEnabled, cfg.ledReverse);
 }
 
 void saveConfig() {
@@ -163,12 +169,21 @@ void saveConfig() {
   prefs.putInt("ledOffset",   cfg.ledOffset);
   prefs.putInt("ledSkip",     cfg.ledSkip);
   prefs.putBool("ledReverse", cfg.ledReverse);
+  prefs.putInt("hTB",  cfg.hourTrailBefore);
+  prefs.putInt("hTA",  cfg.hourTrailAfter);
+  prefs.putInt("hTD",  cfg.hourTrailDecay);
+  prefs.putInt("mTB",  cfg.minTrailBefore);
+  prefs.putInt("mTA",  cfg.minTrailAfter);
+  prefs.putInt("mTD",  cfg.minTrailDecay);
+  prefs.putInt("sTB",  cfg.secTrailBefore);
+  prefs.putInt("sTA",  cfg.secTrailAfter);
+  prefs.putInt("sTD",  cfg.secTrailDecay);
   prefs.end();
-  DBG.printf("saveConfig: showSec=%d ntpEn=%d ledRev=%d\n",
-    cfg.showSeconds, cfg.ntpEnabled, cfg.ledReverse);
 }
 
 // --- LED mapping -------------------------------------------------------------
+// Restituisce posizione FISICA (assoluta nell'array leds[]) dato il valore
+// logico 0-59 (minuti/secondi) oppure 0-59 (ore mappate su 60 step).
 int logicalToPhysical(int logical, int totalLeds, int mode, int offset, int skip, bool reverse) {
   if (totalLeds <= 0) return -1;
   int pos;
@@ -188,12 +203,75 @@ int logicalToPhysical(int logical, int totalLeds, int mode, int offset, int skip
   return skip + pos;
 }
 
-void setLed(int pos, CRGB color, bool blend128 = false) {
-  if (pos < cfg.ledSkip || pos >= cfg.ledSkip + cfg.numLeds) return;
-  if (blend128) {
-    leds[pos] = blend(leds[pos], color, 128);
-  } else {
-    leds[pos] = color;
+// Converte posizione logica (0-59) in posizione nell'anello (0..numLeds-1)
+// senza aggiungere skip — usato internamente per il calcolo trail.
+int logicalToRingPos(int logical, int totalLeds, int mode, int offset, bool reverse) {
+  if (totalLeds <= 0) return -1;
+  int pos;
+  switch (mode) {
+    case 1:
+      pos = logical % totalLeds;
+      break;
+    case 0:
+    case 2:
+    default:
+      pos = (int)round((float)logical * totalLeds / 60.0f) % totalLeds;
+      break;
+  }
+  pos = (pos + offset) % totalLeds;
+  if (reverse) pos = (totalLeds - pos) % totalLeds;
+  return pos;
+}
+
+// Imposta un LED con addizione cromatica (non sovrascrive, somma i canali
+// clampandoli a 255). Permette sovrapposizione trail di lancette diverse.
+void addLed(int physPos, CRGB color) {
+  if (physPos < cfg.ledSkip || physPos >= cfg.ledSkip + cfg.numLeds) return;
+  leds[physPos].r = qadd8(leds[physPos].r, color.r);
+  leds[physPos].g = qadd8(leds[physPos].g, color.g);
+  leds[physPos].b = qadd8(leds[physPos].b, color.b);
+}
+
+// Disegna una lancetta con il suo trail.
+//   ringPos   : posizione centrale nell'anello (0..numLeds-1, senza skip)
+//   baseColor : colore pieno del LED centrale (gia scalato per brightness)
+//   trailBefore, trailAfter : numero di LED sfumati prima/dopo
+//   decayPct  : 0-100, percentuale di luminosita mantenuta per ogni step
+void drawHand(int ringPos, CRGB baseColor, int trailBefore, int trailAfter, int decayPct) {
+  int n = cfg.numLeds;
+  if (n <= 0) return;
+  decayPct = constrain(decayPct, 0, 100);
+
+  // LED centrale - piena luminosita
+  addLed(cfg.ledSkip + ringPos, baseColor);
+
+  // Trail PRIMA (verso posizioni precedenti nell'anello)
+  float factor = decayPct / 100.0f;
+  float mult   = factor;
+  for (int i = 1; i <= trailBefore; i++) {
+    int pos = ((ringPos - i) % n + n) % n;
+    CRGB tc(
+      (uint8_t)(baseColor.r * mult),
+      (uint8_t)(baseColor.g * mult),
+      (uint8_t)(baseColor.b * mult)
+    );
+    addLed(cfg.ledSkip + pos, tc);
+    mult *= factor;
+    if (mult < 0.004f) break;
+  }
+
+  // Trail DOPO (verso posizioni successive nell'anello)
+  mult = factor;
+  for (int i = 1; i <= trailAfter; i++) {
+    int pos = (ringPos + i) % n;
+    CRGB tc(
+      (uint8_t)(baseColor.r * mult),
+      (uint8_t)(baseColor.g * mult),
+      (uint8_t)(baseColor.b * mult)
+    );
+    addLed(cfg.ledSkip + pos, tc);
+    mult *= factor;
+    if (mult < 0.004f) break;
   }
 }
 
@@ -201,40 +279,43 @@ void setLed(int pos, CRGB color, bool blend128 = false) {
 void renderClock(int hour24, int minute, int second) {
   fill_solid(leds, cfg.ledSkip + cfg.numLeds, CRGB::Black);
 
+  // Secondi
   if (cfg.showSeconds) {
-    int secPos = logicalToPhysical(second % 60, cfg.numLeds, cfg.mappingMode,
-                                    cfg.ledOffset, cfg.ledSkip, cfg.ledReverse);
+    int rp = logicalToRingPos(second % 60, cfg.numLeds, cfg.mappingMode,
+                               cfg.ledOffset, cfg.ledReverse);
     CRGB sc(
       (cfg.secR * cfg.secBrightness) / 255,
       (cfg.secG * cfg.secBrightness) / 255,
       (cfg.secB * cfg.secBrightness) / 255
     );
-    setLed(secPos, sc);
+    drawHand(rp, sc, cfg.secTrailBefore, cfg.secTrailAfter, cfg.secTrailDecay);
   }
 
-  int minPos = logicalToPhysical(minute % 60, cfg.numLeds, cfg.mappingMode,
-                                  cfg.ledOffset, cfg.ledSkip, cfg.ledReverse);
-  CRGB mc(
-    (cfg.minR  * cfg.minBrightness)  / 255,
-    (cfg.minG  * cfg.minBrightness)  / 255,
-    (cfg.minB  * cfg.minBrightness)  / 255
-  );
-  bool minOnSec = (cfg.showSeconds && minPos ==
-    logicalToPhysical(second % 60, cfg.numLeds, cfg.mappingMode,
-                      cfg.ledOffset, cfg.ledSkip, cfg.ledReverse));
-  setLed(minPos, mc, minOnSec);
+  // Minuti
+  {
+    int rp = logicalToRingPos(minute % 60, cfg.numLeds, cfg.mappingMode,
+                               cfg.ledOffset, cfg.ledReverse);
+    CRGB mc(
+      (cfg.minR * cfg.minBrightness) / 255,
+      (cfg.minG * cfg.minBrightness) / 255,
+      (cfg.minB * cfg.minBrightness) / 255
+    );
+    drawHand(rp, mc, cfg.minTrailBefore, cfg.minTrailAfter, cfg.minTrailDecay);
+  }
 
-  float hourFrac    = (hour24 % 12) * 5.0f + (minute / 12.0f);
-  int   hourLogical = (int)round(hourFrac) % 60;
-  int   hourPos     = logicalToPhysical(hourLogical, cfg.numLeds, cfg.mappingMode,
-                                         cfg.ledOffset, cfg.ledSkip, cfg.ledReverse);
-  CRGB hc(
-    (cfg.hourR * cfg.hourBrightness) / 255,
-    (cfg.hourG * cfg.hourBrightness) / 255,
-    (cfg.hourB * cfg.hourBrightness) / 255
-  );
-  bool hourOnOther = (hourPos == minPos);
-  setLed(hourPos, hc, hourOnOther);
+  // Ore (si muovono di 5 step ogni ora + interpolazione sui minuti)
+  {
+    float hourFrac    = (hour24 % 12) * 5.0f + (minute / 12.0f);
+    int   hourLogical = (int)round(hourFrac) % 60;
+    int   rp = logicalToRingPos(hourLogical, cfg.numLeds, cfg.mappingMode,
+                                 cfg.ledOffset, cfg.ledReverse);
+    CRGB hc(
+      (cfg.hourR * cfg.hourBrightness) / 255,
+      (cfg.hourG * cfg.hourBrightness) / 255,
+      (cfg.hourB * cfg.hourBrightness) / 255
+    );
+    drawHand(rp, hc, cfg.hourTrailBefore, cfg.hourTrailAfter, cfg.hourTrailDecay);
+  }
 
   FastLED.show();
 }
@@ -254,7 +335,6 @@ void initFastLED() {
 // --- WiFi --------------------------------------------------------------------
 void connectWiFi() {
   if (strlen(cfg.ssid) == 0) {
-    DBG.println("No SSID - starting AP mode");
     WiFi.mode(WIFI_AP);
     WiFi.softAP("MarbleClock", "clock1234");
     DBG.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
@@ -294,10 +374,7 @@ void syncNTP() {
   }
 }
 
-// --- Fallback HTML -----------------------------------------------------------
-// NOTA: questa UI è il fallback quando LittleFS non è disponibile.
-// Il JS usa !!d.showSeconds e !!d.ledReverse per coercizione robusta
-// che funziona sia con bool JSON nativi (true/false) che con interi (0/1).
+// --- Fallback HTML (incorporata nel firmware) --------------------------------
 static const char FALLBACK_HTML[] PROGMEM =
 "<!DOCTYPE html><html><head><meta charset='utf-8'>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -308,87 +385,114 @@ static const char FALLBACK_HTML[] PROGMEM =
 "input,select{width:100%;padding:8px;margin:4px 0 12px;background:#222;border:1px solid #444;color:#eee;border-radius:6px}"
 "button{padding:10px 20px;background:#01696f;color:#fff;border:none;border-radius:6px;cursor:pointer;width:100%;margin:4px 0}"
 ".row{display:flex;gap:8px}.row input{flex:1}"
+".row3{display:flex;gap:8px}.row3 input{flex:1}"
 ".status{background:#1a1a1a;border-radius:8px;padding:12px;margin-bottom:16px;font-size:14px}"
 ".ok{color:#6daa45}.err{color:#dd6974}"
-".chk{display:flex;align-items:center;gap:8px;margin:8px 0}</style></head><body>"
-"<h1>Marble Clock</h1><div class='status' id='st'>Loading...</div>"
-"<h2>WiFi</h2><input id='ssid' placeholder='SSID'><input id='pass' type='password' placeholder='Password'>"
-"<h2>LED</h2>"
+".chk{display:flex;align-items:center;gap:8px;margin:8px 0}"
+"label.small{font-size:12px;color:#aaa}"
+"</style></head><body>"
+"<h1>&#9679; Marble Clock</h1><div class='status' id='st'>Loading...</div>"
+"<h2>WiFi</h2>"
+"<label>SSID</label><input id='ssid' placeholder='Nome rete'>"
+"<label>Password</label><input id='pass' type='password' placeholder='Password'>"
+"<h2>LED Hardware</h2>"
 "<label>Tipo LED</label><select id='ledModel'><option value='0'>WS2812B</option><option value='1'>SK6812</option></select>"
-"<label>Numero LED</label><input id='numLeds' type='number' min='1' max='200'>"
-"<label>LED skip</label><input id='ledSkip' type='number' min='0' max='10'>"
-"<label>Offset rotazione</label><input id='ledOffset' type='number' min='0' max='199'>"
-"<div class='chk'><input type='checkbox' id='ledReverse'><label>Inverti direzione</label></div>"
+"<label>Numero LED nell&apos;anello</label><input id='numLeds' type='number' min='1' max='200'>"
+"<label>LED skip (LED onboard da saltare)</label><input id='ledSkip' type='number' min='0' max='10'>"
+"<label>Offset rotazione (LED di offset per ore 12)</label><input id='ledOffset' type='number' min='0' max='199'>"
+"<div class='chk'><input type='checkbox' id='ledReverse'><label>Inverti direzione anello</label></div>"
 "<label>Luminosita globale</label><input id='brightness' type='range' min='0' max='255'>"
-"<h2>Colori ORE</h2>"
+"<h2>Mapping LED</h2>"
+"<select id='mapMode'>"
+"<option value='0'>Distribuiti uniformemente</option>"
+"<option value='1'>Primi 60 diretti</option>"
+"<option value='2'>Tutti con gap uniforme</option>"
+"</select>"
+"<h2>&#9711; Lancetta ORE</h2>"
+"<label>Colore (R G B)</label>"
 "<div class='row'><input id='hR' type='number' min='0' max='255' placeholder='R'>"
 "<input id='hG' type='number' min='0' max='255' placeholder='G'>"
 "<input id='hB' type='number' min='0' max='255' placeholder='B'></div>"
-"<label>Intensita ore</label><input id='hBri' type='range' min='0' max='255'>"
-"<h2>Colori MINUTI</h2>"
+"<label>Intensita</label><input id='hBri' type='range' min='0' max='255'>"
+"<label>Trail PRIMA del LED (0-10)</label><input id='hTB' type='number' min='0' max='10'>"
+"<label>Trail DOPO il LED (0-10)</label><input id='hTA' type='number' min='0' max='10'>"
+"<label>Decay trail % (0=niente, 100=invariato)</label><input id='hTD' type='range' min='0' max='100'><span id='hTDv'></span>"
+"<h2>&#9711; Lancetta MINUTI</h2>"
+"<label>Colore (R G B)</label>"
 "<div class='row'><input id='mR' type='number' min='0' max='255' placeholder='R'>"
 "<input id='mG' type='number' min='0' max='255' placeholder='G'>"
 "<input id='mB' type='number' min='0' max='255' placeholder='B'></div>"
-"<label>Intensita minuti</label><input id='mBri' type='range' min='0' max='255'>"
-"<h2>Secondi</h2>"
+"<label>Intensita</label><input id='mBri' type='range' min='0' max='255'>"
+"<label>Trail PRIMA del LED (0-10)</label><input id='mTB' type='number' min='0' max='10'>"
+"<label>Trail DOPO il LED (0-10)</label><input id='mTA' type='number' min='0' max='10'>"
+"<label>Decay trail %</label><input id='mTD' type='range' min='0' max='100'><span id='mTDv'></span>"
+"<h2>&#9711; Lancetta SECONDI</h2>"
 "<div class='chk'><input type='checkbox' id='showSeconds'><label>Mostra lancetta secondi</label></div>"
+"<label>Colore (R G B)</label>"
 "<div class='row'><input id='sR' type='number' min='0' max='255' placeholder='R'>"
 "<input id='sG' type='number' min='0' max='255' placeholder='G'>"
 "<input id='sB' type='number' min='0' max='255' placeholder='B'></div>"
-"<label>Intensita secondi</label><input id='sBri' type='range' min='0' max='255'>"
+"<label>Intensita</label><input id='sBri' type='range' min='0' max='255'>"
+"<label>Trail PRIMA del LED (0-10)</label><input id='sTB' type='number' min='0' max='10'>"
+"<label>Trail DOPO il LED (0-10)</label><input id='sTA' type='number' min='0' max='10'>"
+"<label>Decay trail %</label><input id='sTD' type='range' min='0' max='100'><span id='sTDv'></span>"
 "<h2>Orario</h2>"
-"<label>UTC Offset (3600=CET, 7200=CEST)</label><input id='utcOff' type='number'>"
-"<label>Ora manuale (-1=NTP)</label>"
-"<div class='row'><input id='manH' type='number' min='-1' max='23'><input id='manM' type='number' min='0' max='59'></div>"
-"<h2>Mapping</h2><select id='mapMode'>"
-"<option value='0'>Distribuiti uniformemente</option>"
-"<option value='1'>Primi 60</option><option value='2'>Tutti con gap</option></select><br><br>"
-"<button onclick='save()'>Salva e applica</button>"
-"<button onclick='doSyncNTP()'>Sync NTP</button>"
-"<button onclick='reboot()'>Riavvia</button>"
+"<label>UTC Offset secondi (3600=CET, 7200=CEST)</label><input id='utcOff' type='number'>"
+"<label>Ora manuale (-1 = usa NTP)</label>"
+"<div class='row'><input id='manH' type='number' min='-1' max='23' placeholder='Ora'>"
+"<input id='manM' type='number' min='0' max='59' placeholder='Min'></div><br>"
+"<button onclick='save()'>&#10003; Salva e applica</button>"
+"<button onclick='doSyncNTP()'>&#8635; Sync NTP</button>"
+"<button onclick='reboot()'>&#8635; Riavvia</button>"
 "<script>"
-"async function load(){try{const r=await fetch('/api/status');const d=await r.json();"
-"document.getElementById('st').innerHTML=`WiFi: <span class='${d.wifiConnected?'ok':'err'}'>${d.wifiConnected?d.ip:'offline'}</span>`"
-"+` | NTP: <span class='${d.ntpSynced?'ok':'err'}'>${d.ntpSynced?d.hour+':'+String(d.minute).padStart(2,'0'):'no sync'}</span>`;"
-"document.getElementById('ssid').value=d.ssid||'';"
-"document.getElementById('numLeds').value=d.numLeds;"
-"document.getElementById('ledSkip').value=d.ledSkip!=null?d.ledSkip:1;"
-"document.getElementById('ledOffset').value=d.ledOffset||0;"
-// FIX: !!d.ledReverse funziona con bool nativi E con interi 0/1
-"document.getElementById('ledReverse').checked=!!d.ledReverse;"
-"document.getElementById('brightness').value=d.brightness;"
-"document.getElementById('hR').value=d.hourR;document.getElementById('hG').value=d.hourG;document.getElementById('hB').value=d.hourB;"
-"document.getElementById('mR').value=d.minR;document.getElementById('mG').value=d.minG;document.getElementById('mB').value=d.minB;"
-"document.getElementById('sR').value=d.secR!=null?d.secR:200;document.getElementById('sG').value=d.secG||0;document.getElementById('sB').value=d.secB||0;"
-"document.getElementById('hBri').value=d.hourBrightness;document.getElementById('mBri').value=d.minBrightness;"
-"document.getElementById('sBri').value=d.secBrightness!=null?d.secBrightness:160;"
-// FIX: !!d.showSeconds funziona con bool nativi E con interi 0/1
-"document.getElementById('showSeconds').checked=!!d.showSeconds;"
-"document.getElementById('utcOff').value=d.utcOffsetSec;"
-"document.getElementById('manH').value=d.manualHour;document.getElementById('manM').value=d.manualMinute;"
-"document.getElementById('mapMode').value=d.mappingMode;"
-"document.getElementById('ledModel').value=d.ledModel||0;"
-"}catch(e){document.getElementById('st').innerHTML=\"<span class='err'>Errore</span>\";}"
+"function sv(id,val){document.getElementById(id).value=val;}"
+"function gv(id){return document.getElementById(id).value;}"
+"function gi(id){return +document.getElementById(id).value;}"
+"function gc(id){return document.getElementById(id).checked;}"
+"function sc(id,v){document.getElementById(id).checked=!!v;}"
+"function bindDecay(id,spId){"
+"  const el=document.getElementById(id),sp=document.getElementById(spId);"
+"  const upd=()=>sp.textContent=' '+el.value+'%';"
+"  el.addEventListener('input',upd);upd();"
 "}"
+"async function load(){try{"
+"const r=await fetch('/api/status');const d=await r.json();"
+"document.getElementById('st').innerHTML="
+"  `WiFi: <span class='${d.wifiConnected?'ok':'err'}'>${d.wifiConnected?d.ip:'offline'}</span>`"
+"  +` | NTP: <span class='${d.ntpSynced?'ok':'err'}'>${d.ntpSynced?d.hour+':'+String(d.minute).padStart(2,'0'):'no sync'}</span>`;"
+"sv('ssid',d.ssid||'');"
+"sv('numLeds',d.numLeds);sv('ledSkip',d.ledSkip??1);sv('ledOffset',d.ledOffset??0);"
+"sc('ledReverse',d.ledReverse);sv('brightness',d.brightness);"
+"sv('hR',d.hourR);sv('hG',d.hourG);sv('hB',d.hourB);sv('hBri',d.hourBrightness);"
+"sv('mR',d.minR);sv('mG',d.minG);sv('mB',d.minB);sv('mBri',d.minBrightness);"
+"sv('sR',d.secR??200);sv('sG',d.secG??0);sv('sB',d.secB??0);sv('sBri',d.secBrightness??160);"
+"sc('showSeconds',d.showSeconds);"
+"sv('hTB',d.hourTrailBefore??2);sv('hTA',d.hourTrailAfter??2);sv('hTD',d.hourTrailDecay??50);"
+"sv('mTB',d.minTrailBefore??2);sv('mTA',d.minTrailAfter??2);sv('mTD',d.minTrailDecay??50);"
+"sv('sTB',d.secTrailBefore??1);sv('sTA',d.secTrailAfter??1);sv('sTD',d.secTrailDecay??40);"
+"sv('utcOff',d.utcOffsetSec);sv('manH',d.manualHour);sv('manM',d.manualMinute);"
+"sv('mapMode',d.mappingMode);sv('ledModel',d.ledModel??0);"
+"['hTD','mTD','sTD'].forEach(id=>document.getElementById(id).dispatchEvent(new Event('input')));"
+"}catch(e){document.getElementById('st').innerHTML=\"<span class='err'>Errore connessione</span>\";}}"
 "async function save(){"
-"const body={ssid:document.getElementById('ssid').value,password:document.getElementById('pass').value,"
-"numLeds:+document.getElementById('numLeds').value,ledSkip:+document.getElementById('ledSkip').value,"
-"ledOffset:+document.getElementById('ledOffset').value,"
-"ledReverse:document.getElementById('ledReverse').checked,"
-"brightness:+document.getElementById('brightness').value,"
-"hourR:+document.getElementById('hR').value,hourG:+document.getElementById('hG').value,hourB:+document.getElementById('hB').value,"
-"minR:+document.getElementById('mR').value,minG:+document.getElementById('mG').value,minB:+document.getElementById('mB').value,"
-"secR:+document.getElementById('sR').value,secG:+document.getElementById('sG').value,secB:+document.getElementById('sB').value,"
-"hourBrightness:+document.getElementById('hBri').value,minBrightness:+document.getElementById('mBri').value,"
-"secBrightness:+document.getElementById('sBri').value,"
-"showSeconds:document.getElementById('showSeconds').checked,"
-"utcOffsetSec:+document.getElementById('utcOff').value,"
-"manualHour:+document.getElementById('manH').value,manualMinute:+document.getElementById('manM').value,"
-"mappingMode:+document.getElementById('mapMode').value,ledModel:+document.getElementById('ledModel').value};"
+"const body={"
+"ssid:gv('ssid'),password:gv('pass'),"
+"numLeds:gi('numLeds'),ledSkip:gi('ledSkip'),ledOffset:gi('ledOffset'),"
+"ledReverse:gc('ledReverse'),brightness:gi('brightness'),"
+"hourR:gi('hR'),hourG:gi('hG'),hourB:gi('hB'),hourBrightness:gi('hBri'),"
+"minR:gi('mR'),minG:gi('mG'),minB:gi('mB'),minBrightness:gi('mBri'),"
+"secR:gi('sR'),secG:gi('sG'),secB:gi('sB'),secBrightness:gi('sBri'),"
+"showSeconds:gc('showSeconds'),"
+"hourTrailBefore:gi('hTB'),hourTrailAfter:gi('hTA'),hourTrailDecay:gi('hTD'),"
+"minTrailBefore:gi('mTB'),minTrailAfter:gi('mTA'),minTrailDecay:gi('mTD'),"
+"secTrailBefore:gi('sTB'),secTrailAfter:gi('sTA'),secTrailDecay:gi('sTD'),"
+"utcOffsetSec:gi('utcOff'),manualHour:gi('manH'),manualMinute:gi('manM'),"
+"mappingMode:gi('mapMode'),ledModel:gi('ledModel'),ntpEnabled:true};"
 "await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
 "alert('Salvato!');load();}"
 "async function doSyncNTP(){await fetch('/api/syncntp',{method:'POST'});alert('Sync NTP avviato');setTimeout(load,2500);}"
-"async function reboot(){await fetch('/api/reconnect',{method:'POST'});alert('Riavvio...');}"
+"async function reboot(){await fetch('/api/reconnect',{method:'POST'});alert('Riavvio in corso...');}"
+"bindDecay('hTD','hTDv');bindDecay('mTD','mTDv');bindDecay('sTD','sTDv');"
 "load();"
 "</script></body></html>";
 
@@ -400,7 +504,7 @@ void setupWebServer() {
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
     if (!littlefsOK || !LittleFS.exists("/index.html")) {
-      req->send_P(200, "text/html", FALLBACK_HTML);
+      req->send(200, "text/html", FALLBACK_HTML);
     } else {
       req->send(LittleFS, "/index.html", "text/html");
     }
@@ -417,8 +521,8 @@ void setupWebServer() {
       doc["minute"] = timeClient.getMinutes();
       doc["second"] = timeClient.getSeconds();
     }
-    doc["ntpSynced"]      = ntpSynced;
-    doc["wifiConnected"]  = wifiConnected;
+    doc["ntpSynced"]      = (bool)ntpSynced;
+    doc["wifiConnected"]  = (bool)wifiConnected;
     doc["ip"]             = wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
     doc["ssid"]           = cfg.ssid;
     doc["numLeds"]        = cfg.numLeds;
@@ -435,9 +539,6 @@ void setupWebServer() {
     doc["hourBrightness"] = cfg.hourBrightness;
     doc["minBrightness"]  = cfg.minBrightness;
     doc["secBrightness"]  = cfg.secBrightness;
-    // FIX v3: bool nativi JSON - non piu interi 0/1.
-    // Il JS usa !!d.showSeconds quindi funziona in entrambi i casi,
-    // ma mandare bool nativi e piu corretto e leggibile.
     doc["showSeconds"]    = (bool)cfg.showSeconds;
     doc["ntpEnabled"]     = (bool)cfg.ntpEnabled;
     doc["ledReverse"]     = (bool)cfg.ledReverse;
@@ -449,6 +550,15 @@ void setupWebServer() {
     doc["ledModel"]       = cfg.ledModel;
     doc["ledOffset"]      = cfg.ledOffset;
     doc["ledSkip"]        = cfg.ledSkip;
+    doc["hourTrailBefore"] = cfg.hourTrailBefore;
+    doc["hourTrailAfter"]  = cfg.hourTrailAfter;
+    doc["hourTrailDecay"]  = cfg.hourTrailDecay;
+    doc["minTrailBefore"]  = cfg.minTrailBefore;
+    doc["minTrailAfter"]   = cfg.minTrailAfter;
+    doc["minTrailDecay"]   = cfg.minTrailDecay;
+    doc["secTrailBefore"]  = cfg.secTrailBefore;
+    doc["secTrailAfter"]   = cfg.secTrailAfter;
+    doc["secTrailDecay"]   = cfg.secTrailDecay;
     String json;
     serializeJson(doc, json);
     req->send(200, "application/json", json);
@@ -481,14 +591,9 @@ void setupWebServer() {
       if (!doc["hourBrightness"].isNull())   cfg.hourBrightness = constrain((int)doc["hourBrightness"], 0, 255);
       if (!doc["minBrightness"].isNull())    cfg.minBrightness  = constrain((int)doc["minBrightness"], 0, 255);
       if (!doc["secBrightness"].isNull())    cfg.secBrightness  = constrain((int)doc["secBrightness"], 0, 255);
-
-      // Usa readJsonBool() per TUTTI i campi booleani - accesso singolo sicuro
       cfg.showSeconds = readJsonBool(doc, "showSeconds", cfg.showSeconds);
       cfg.ntpEnabled  = readJsonBool(doc, "ntpEnabled",  cfg.ntpEnabled);
       cfg.ledReverse  = readJsonBool(doc, "ledReverse",  cfg.ledReverse);
-
-      DBG.printf("showSeconds ricevuto: %d\n", cfg.showSeconds ? 1 : 0);
-
       if (!doc["utcOffsetSec"].isNull()) {
         int newOff = (int)doc["utcOffsetSec"];
         if (newOff != cfg.utcOffsetSec) { cfg.utcOffsetSec = newOff; utcChanged = true; }
@@ -503,12 +608,18 @@ void setupWebServer() {
         int newModel = constrain((int)doc["ledModel"], 0, 1);
         if (newModel != cfg.ledModel) { cfg.ledModel = newModel; modelChanged = true; }
       }
+      // Trail
+      if (!doc["hourTrailBefore"].isNull()) cfg.hourTrailBefore = constrain((int)doc["hourTrailBefore"], 0, 10);
+      if (!doc["hourTrailAfter"].isNull())  cfg.hourTrailAfter  = constrain((int)doc["hourTrailAfter"],  0, 10);
+      if (!doc["hourTrailDecay"].isNull())  cfg.hourTrailDecay  = constrain((int)doc["hourTrailDecay"],  0, 100);
+      if (!doc["minTrailBefore"].isNull())  cfg.minTrailBefore  = constrain((int)doc["minTrailBefore"],  0, 10);
+      if (!doc["minTrailAfter"].isNull())   cfg.minTrailAfter   = constrain((int)doc["minTrailAfter"],   0, 10);
+      if (!doc["minTrailDecay"].isNull())   cfg.minTrailDecay   = constrain((int)doc["minTrailDecay"],   0, 100);
+      if (!doc["secTrailBefore"].isNull())  cfg.secTrailBefore  = constrain((int)doc["secTrailBefore"],  0, 10);
+      if (!doc["secTrailAfter"].isNull())   cfg.secTrailAfter   = constrain((int)doc["secTrailAfter"],   0, 10);
+      if (!doc["secTrailDecay"].isNull())   cfg.secTrailDecay   = constrain((int)doc["secTrailDecay"],   0, 100);
       FastLED.setBrightness(cfg.brightness);
       saveConfig();
-
-      DBG.printf("Config salvata: showSec=%d ntpEn=%d ledRev=%d\n",
-        cfg.showSeconds, cfg.ntpEnabled, cfg.ledReverse);
-
       if (utcChanged && wifiConnected && cfg.ntpEnabled) syncNTP();
       req->send(200, "application/json", modelChanged ?
         "{\"ok\":true,\"rebootRequired\":true}" :
@@ -545,13 +656,8 @@ void setup() {
   fill_solid(leds, MAX_LEDS, CRGB::Black);
   FastLED.show();
 
-  DBG.printf("Config: %d LED, skip %d, offset %d, reverse %d, model %d, showSec %d\n",
-    cfg.numLeds, cfg.ledSkip, cfg.ledOffset, cfg.ledReverse, cfg.ledModel, cfg.showSeconds);
-
   littlefsOK = LittleFS.begin(true);
   DBG.println(littlefsOK ? "LittleFS OK" : "LittleFS FAILED - fallback attivo");
-  if (littlefsOK && !LittleFS.exists("/index.html"))
-    DBG.println("index.html mancante - fallback attivo");
 
   connectWiFi();
   syncNTP();
@@ -561,6 +667,7 @@ void setup() {
 
   setupWebServer();
 
+  // Startup animation: sweep dell'anello
   for (int i = 0; i < cfg.numLeds; i++) {
     fill_solid(leds, MAX_LEDS, CRGB::Black);
     leds[cfg.ledSkip + i] = CRGB(0, 50, 80);
